@@ -1,0 +1,6 @@
+<resources>
+    <style name="Theme.PaintAndroid" parent="android:Theme.Material.NoActionBar">
+        <item name="android:statusBarColor">#F5F2E8</item>
+        <item name="android:navigationBarColor">#F5F2E8</item>
+    </style>
+</resources>
