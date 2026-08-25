@@ -26,11 +26,10 @@ android {
             cmake {
                 // 禁用 SDK 的 host 单测（tests/ 用 CMAKE_SOURCE_DIR 指消费者根，会失效）。
                 arguments += "-DDGCPAIN_BUILD_TESTS=OFF"
-                // 环境修复：SDK B2-1 Vulkan 离屏后端需 shaderc，NDK 无 arm64 预编译
-                // shaderc（仅源码，缺 glslang/spirv-tools），host amd64 lib 无法交叉链接进
-                // arm64-v8a。按 SDK 官方 Android 口径「Null 后端不硬依赖」关闭 Vulkan，
-                // 保证 assembleDebug 编译门全绿；真机离屏渲染依赖 arm64 shaderc 构建（后续项）。
-                arguments += "-DDGCPAIN_RENDER_VULKAN=OFF"
+                // B5-1 已解决：NDK 无 libshaderc → 改用 NDK 自带 glslc 构建期把
+                // brush_composite.comp 预编译为 SPIR-V 内嵌字节数组。arm64-v8a 现在
+                // 可编出带真实 Vulkan 后端（VkBackend）的 libdgc_paint.so。
+                arguments += "-DDGCPAIN_RENDER_VULKAN=ON"
                 cppFlags += "-std=c++17"
             }
         }
