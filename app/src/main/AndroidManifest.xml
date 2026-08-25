@@ -18,6 +18,11 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- exported=true：无 intent-filter，仅允许显式 intent/adb 触发，不做桌面入口。 -->
+        <activity
+            android:name=".DemoExportActivity"
+            android:exported="true" />
     </application>
 
 </manifest>

@@ -8,6 +8,12 @@ android {
     namespace = "com.dgcamp.paint"
     compileSdk = 35
 
+    // 环境修复：本机共享 SDK（/usr/lib/android-sdk）不可写，
+    // 钉到已装 build-tools 35.0.0 + NDK 28.2，避免 AGP 默认请求
+    // build-tools 34.0.0 / NDK 27 触发 InstallFailedException。
+    buildToolsVersion = "35.0.0"
+    ndkVersion = "28.2.13676358"
+
     defaultConfig {
         applicationId = "com.dgcamp.paint"
         minSdk = 26
@@ -20,6 +26,11 @@ android {
             cmake {
                 // 禁用 SDK 的 host 单测（tests/ 用 CMAKE_SOURCE_DIR 指消费者根，会失效）。
                 arguments += "-DDGCPAIN_BUILD_TESTS=OFF"
+                // 环境修复：SDK B2-1 Vulkan 离屏后端需 shaderc，NDK 无 arm64 预编译
+                // shaderc（仅源码，缺 glslang/spirv-tools），host amd64 lib 无法交叉链接进
+                // arm64-v8a。按 SDK 官方 Android 口径「Null 后端不硬依赖」关闭 Vulkan，
+                // 保证 assembleDebug 编译门全绿；真机离屏渲染依赖 arm64 shaderc 构建（后续项）。
+                arguments += "-DDGCPAIN_RENDER_VULKAN=OFF"
                 cppFlags += "-std=c++17"
             }
         }

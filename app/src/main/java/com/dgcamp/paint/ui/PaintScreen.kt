@@ -1,9 +1,9 @@
 package com.dgcamp.paint.ui
 
+import android.graphics.Bitmap
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectDragGestures
-import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
@@ -11,39 +11,71 @@ import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
-import androidx.compose.runtime.Composable
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableFloatStateOf
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
+import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.IntSize
 import com.dgcamp.paint.jni.PaintNative
+import java.nio.ByteBuffer
 
 /**
- * 绘画画布（空壳期）。
+ * 绘画画布（SDK C API 接入）。
  *
- * 本轮只做两件事：
- *  1. 纸白画布 + 触摸坐标 / 压感显示（输入桩，不转发）。
- *  2. JNI 自检：显示 PaintNative.nativeHello() 返回值，证明 native 库加载成功。
+ * 数据流：触摸输入 → JNI → dgcBeginStroke/StrokeTo/EndStroke → 引擎渲染 →
+ *         每帧 dgcReadbackPixels 读回 RGBA8 → 复用单个 Bitmap → ImageBitmap 上屏。
+ * 浮层显示 FPS / 帧时 ms / 读回耗时 ms（spec 验收 #3）。
  *
- * SDK C API 接入后（等 B1-4）：
- *  - pointerInput 回调改为调用 dgcBeginStroke / dgcStrokeTo / dgcEndStroke（经 JNI）。
- *  - Canvas 改为贴 dgc_paint 渲染结果（TextureView / Surface 合成）。
+ * 依赖：B3-1 真实内核未合并时笔迹不可见（Null 内核），本期只验收链路 + FPS 浮层。
  */
 @Composable
 fun PaintScreen() {
-    var lastX by remember { mutableFloatStateOf(0f) }
-    var lastY by remember { mutableFloatStateOf(0f) }
-    var lastPressure by remember { mutableFloatStateOf(0f) }
-    var jniMsg by remember { mutableStateOf(PaintNative.nativeHello()) }
+    // 画布逻辑尺寸（1080x720 内，避免 readback 带宽过大；真机可按屏宽高）
+    val cw = 1080
+    val ch = 720
 
-    val canvasColor = Color(0xFFF5F2E8) // 纸白
+    var bitmap by remember { mutableStateOf<Bitmap?>(null) }
+    var fps by remember { mutableFloatStateOf(0f) }
+    var frameMs by remember { mutableFloatStateOf(0f) }
+    var readMs by remember { mutableFloatStateOf(0f) }
+    var lastError by remember { mutableStateOf("") }
+    val ctx = remember { PaintNative }
+    val started = remember { ctx.nativeInit(cw, ch) }
+    DisposableEffect(Unit) { onDispose { ctx.nativeDestroy() } }
+
+    // 复用单个 Bitmap，避免每帧 createBitmap 在主线程分配（3MB/帧）造成 GC churn。
+    val bmp = remember { Bitmap.createBitmap(cw, ch, Bitmap.Config.ARGB_8888) }
+
+    // 每帧：readback → 复用 bitmap 更新 → 计算 fps/帧时/读回耗时
+    LaunchedEffect(Unit) {
+        var frames = 0; var last = System.nanoTime(); var prev = last
+        while (true) {
+            withFrameNanos { now ->
+                val rb0 = System.nanoTime()
+                val arr = ctx.nativeReadback()
+                val rb1 = System.nanoTime()
+                readMs = (rb1 - rb0) / 1_000_000f
+                if (arr != null) {
+                    bmp.copyPixelsFromBuffer(ByteBuffer.wrap(arr))
+                    bitmap = bmp   // 同一实例，避免重复分配
+                } else {
+                    lastError = "readback failed"
+                }
+                frames++
+                if (now - last >= 500_000_000L) {
+                    fps = frames * 1e9f / (now - last).toFloat()
+                    frameMs = 1000f / (if (fps > 0f) fps else 1f)
+                    frames = 0; last = now
+                }
+            }
+        }
+    }
+
+    val canvasColor = Color(0xFFF5F2E8)
     val overlayColor = Color.Black.copy(alpha = 0.7f)
 
     Scaffold { innerPadding ->
@@ -54,42 +86,24 @@ fun PaintScreen() {
                 .background(canvasColor)
                 .pointerInput(Unit) {
                     detectDragGestures(
-                        onDragStart = { offset ->
-                            lastX = offset.x
-                            lastY = offset.y
-                            // TODO(C API): dgcBeginStroke(ctx, offset.x, offset.y, 0.5f, 0f, 0f)
-                        },
-                        onDrag = { change, _ ->
-                            change.consume()
-                            lastX = change.position.x
-                            lastY = change.position.y
-                            // TODO(C API): dgcStrokeTo(ctx, position.x, position.y, 0.5f, 0f, 0f, 0)
-                        },
-                        onDragEnd = {
-                            // TODO(C API): dgcEndStroke(ctx); dgcRender(ctx)
-                        },
+                        onDragStart = { offset -> ctx.nativeStrokeBegin(offset.x, offset.y, 0.5f) },
+                        onDrag = { change, _ -> change.consume(); ctx.nativeStrokeTo(change.position.x, change.position.y, 0.5f) },
+                        onDragEnd = { ctx.nativeStrokeEnd() },
                     )
-                }
-                .pointerInput(Unit) {
-                    detectTapGestures { offset ->
-                        lastX = offset.x
-                        lastY = offset.y
-                        lastPressure = 1f
-                    }
                 },
         ) {
-            // 画布占位（纸白，无渲染内容）。
-            Canvas(modifier = Modifier.fillMaxSize()) {}
-
-            // 状态浮层。
+            val bmp = bitmap
+            if (bmp != null) {
+                Canvas(modifier = Modifier.fillMaxSize()) {
+                    drawImage(bmp.asImageBitmap(), dstSize = IntSize(this.size.width.toInt(), this.size.height.toInt()))
+                }
+            }
             Text(
-                text = "paint-android 外壳 · SDK C API 未接入\n$jniMsg\n触摸: (${lastX.toInt()}, ${lastY.toInt()}) 压感: ${"%.2f".format(lastPressure)}",
+                text = if (!started) "SDK init failed" else
+                    "FPS: ${"%.1f".format(fps)}\nFrame: ${"%.2f".format(frameMs)} ms\nReadback: ${"%.2f".format(readMs)} ms\n$lastError",
                 color = overlayColor,
                 style = MaterialTheme.typography.bodyLarge,
-                modifier = Modifier
-                    .align(Alignment.TopStart)
-                    .safeDrawingPadding()
-                    .padding(12.dp),
+                modifier = Modifier.align(Alignment.TopStart).safeDrawingPadding().padding(12.dp),
             )
         }
     }
