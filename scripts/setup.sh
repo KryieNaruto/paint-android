@@ -159,6 +159,20 @@ sync_submodule() {
   git -C "$root" submodule update --init --recursive
 }
 
+# 探测三方库（复用 SDK 共享 fetch-deps.sh --check）。Android 大库（SDK/NDK）由 SDK Manager
+# 供给，fetch-deps 对它们仅探测 + 指引（manifest platform 过滤，不自动拉）；host 侧
+# vulkan/shaderc 与本 Android 构建无关，故 --check 结果仅作指引、不回传退出码、不阻断构建。
+fetch_deps() {
+  local root="$1"
+  local sdk_script="$root/sdk/scripts/fetch-deps.sh"
+  if [ ! -f "$sdk_script" ]; then
+    warn "未找到 sdk/scripts/fetch-deps.sh（submodule 未更新到含共享拉取脚本的版本？跳过）"
+    return 0
+  fi
+  info "探测三方库（fetch-deps --check）…"
+  bash "$sdk_script" --check || true
+}
+
 build_apk() {
   local root="$1"
   info "构建 APK（./gradlew assembleDebug）…"
@@ -197,6 +211,7 @@ main() {
   fi
 
   sync_submodule "$root"
+  fetch_deps "$root"
   build_apk "$root"
 
   if [ "$mode" = "test" ]; then
