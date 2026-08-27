@@ -60,15 +60,29 @@ probe_java() {
   else record "JDK (java)" "硬" "OK" "已安装但版本无法确认（请手动确认 ≥ 17）"; fi
 }
 
+# 解析本机 local.properties 的 sdk.dir，兼容 Android Studio 用 java.util.Properties 转义的
+# Windows 路径（sdk.dir=C\:\\Users\\...）：反转义 \\ 与 \:，并把反斜杠统一为前斜杠供 test -d。
+resolve_sdk_dir() {
+  local f="$root/local.properties" v
+  [ -f "$f" ] || return 0
+  v="$(sed -n 's/^sdk\.dir=//p' "$f" 2>/dev/null | head -n1 || true)"
+  [ -n "$v" ] || return 0
+  v="$(printf '%s' "$v" | sed -e 's/\\\\/\\/g' -e 's/\\:/:/g')"
+  v="${v//\\//}"
+  printf '%s' "$v"
+}
+
 probe_android_sdk() {
-  # 读 local.properties 的 sdk.dir，或环境变量 ANDROID_HOME / ANDROID_SDK_ROOT。
-  local sdkroot="$root"
+  # 读 local.properties 的 sdk.dir（优先），或环境变量 ANDROID_SDK_ROOT / ANDROID_HOME，
+  # 兜底 Android Studio 默认 SDK 位置（%LOCALAPPDATA%/Android/Sdk）。
   local sdkloc=""
-  if [ -f "$sdkroot/local.properties" ]; then
-    sdkloc="$(sed -n 's/^sdk\.dir=//p' "$sdkroot/local.properties" 2>/dev/null || true)"
-  fi
+  sdkloc="$(resolve_sdk_dir)"
   [ -z "$sdkloc" ] && sdkloc="${ANDROID_SDK_ROOT:-}"
   [ -z "$sdkloc" ] && sdkloc="${ANDROID_HOME:-}"
+  if [ -z "$sdkloc" ] && [ -n "${LOCALAPPDATA:-}" ]; then
+    local lapd="${LOCALAPPDATA//\\//}"
+    [ -d "$lapd/Android/Sdk" ] && sdkloc="$lapd/Android/Sdk"
+  fi
   if [ -z "$sdkloc" ] || [ ! -d "$sdkloc" ]; then
     record "Android SDK" "硬" "MISS(硬)" "未找到 Android SDK（设 sdk.dir 到 local.properties，或 \$ANDROID_HOME）"; HARD_MISS=$((HARD_MISS+1)); return
   fi
@@ -76,13 +90,11 @@ probe_android_sdk() {
 }
 
 probe_ndk() {
-  local ndk=""
-  local platforms_ndk
-  # NDK 优先看 local.properties / ANDROID_NDK_HOME / SDK/ndk/ 目录。
+  local ndk="" platforms_ndk="" sdkloc=""
+  # NDK 优先看 ANDROID_NDK_HOME，其次 local.properties 的 sdk.dir/ndk/ 目录。
   ndk="${ANDROID_NDK_HOME:-}"
-  if [ -z "$ndk" ] && [ -f "$root/local.properties" ]; then
-    local sdkloc
-    sdkloc="$(sed -n 's/^sdk\.dir=//p' "$root/local.properties" 2>/dev/null || true)"
+  if [ -z "$ndk" ]; then
+    sdkloc="$(resolve_sdk_dir)"
     [ -n "$sdkloc" ] && platforms_ndk="$(ls "$sdkloc/ndk/" 2>/dev/null | sort -V | tail -n1 || true)"
     [ -n "$platforms_ndk" ] && ndk="$sdkloc/ndk/$platforms_ndk"
   fi
