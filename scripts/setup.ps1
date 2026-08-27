@@ -7,7 +7,7 @@
       1) 探测  JDK≥17 / Android SDK / NDK 28 / git；
       2) 补缺  硬依赖缺失给精确安装指引（sdkmanager / Android Studio / JDK 下载），
               并提示写 local.properties；
-      3) 拉取  git submodule update（SDK，钉 9e6eefb）；
+      3) 拉取  git submodule update --remote（SDK 跟随 paintDemo main 最新，不钉 pin）；
       4) 构建  .\gradlew.bat assembleDebug（arm64-v8a + 真实 Vulkan 后端）；
       5) 测试  --test 模式 = assembleDebug 编译门 + DemoExport 离屏自检代码审读。
 
@@ -139,9 +139,9 @@ function Print-Guidance {
 
 function Sync-Submodule {
     param([string]$R)
-    Info "同步 SDK submodule…"
+    Info "同步 SDK submodule（跟随 paintDemo main 最新）…"
     Push-Location $R
-    & git submodule update --init --recursive
+    & git submodule update --init --recursive --remote
     if ($LASTEXITCODE -ne 0) { Err "submodule 同步失败"; Pop-Location; exit 1 }
     Pop-Location
 }

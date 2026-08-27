@@ -56,19 +56,21 @@ echo "sdk.dir=$HOME/Android/Sdk" > local.properties
 
 ## 接入 SDK（下一轮，等 B1-4 C API 落地）
 
-1. 重钉 `sdk/` submodule 到含 C API 的 commit。
+1. SDK 跟随 `main` 最新，`scripts/setup.*` 会 `--remote` 拉到最新，不需手动钉版本。
 2. `jni/paint_android_jni.cpp`：`#include "dgc_paint_c_api.h"`，把 `MotionEvent` 转成 `dgcBeginStroke` → `dgcStrokeTo`（`isPredicted` 按消费者策略送）→ `dgcEndStroke` → `dgcRender`；native window 经 `dgcSetSurface` 传入。
 3. `PaintNative.kt` 增加对应 JNI 绑定。
 4. 渲染结果 present 到屏幕（TextureView / Vulkan surface 合成）。
 
 ## 接入 SDK（submodule）
 
+SDK 子模块**默认跟随 `main` 最新**（`.gitmodules` 里 `branch = main`），`scripts/setup.*` 每次构建都 `git submodule update --init --recursive --remote` 拉到最新，不钉版本：
+
 ```bash
-/path/to/paintDemo/scripts/bootstrap-consumer.sh --tag <tag>
-git add .gitmodules sdk && git commit -m "chore: submodule paintDemo SDK 到 sdk/"
+.\scripts\setup.ps1          # Windows：拉最新 SDK + 构建
+git add sdk && git commit -m "chore: sdk 跟随 main <sha>"   # 可选：记录本次拉到的 commit
 ```
 
-钉 commit / tag，禁止长期漂浮跟踪 main。详见 [docs/git/README.md](https://github.com/KryieNaruto/paintDemo/blob/main/docs/git/README.md)。
+> 如需临时钉某个 SDK commit/tag（例如发布快照），可 `git -C sdk checkout <commit>` 覆盖，但不作为长期约定。详见 [docs/git/README.md](https://github.com/KryieNaruto/paintDemo/blob/main/docs/git/README.md)。
 
 ## CMake 约定
 

@@ -167,8 +167,8 @@ EOF
 # ---------- 动作 ----------
 sync_submodule() {
   local root="$1"
-  info "同步 SDK submodule…"
-  git -C "$root" submodule update --init --recursive
+  info "同步 SDK submodule（跟随 paintDemo main 最新）…"
+  git -C "$root" submodule update --init --recursive --remote
 }
 
 # 探测三方库（复用 SDK 共享 fetch-deps.sh --check）。Android 大库（SDK/NDK）由 SDK Manager
