@@ -18,8 +18,9 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.unit.dp
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.unit.IntSize
+import androidx.compose.ui.unit.dp
 import com.dgcamp.paint.jni.PaintNative
 import java.nio.ByteBuffer
 
@@ -43,6 +44,10 @@ fun PaintScreen() {
     var frameMs by remember { mutableFloatStateOf(0f) }
     var readMs by remember { mutableFloatStateOf(0f) }
     var lastError by remember { mutableStateOf("") }
+    // 显示区尺寸（像素），用于把屏幕触摸坐标映射到 1080x720 离屏画布坐标。
+    // currentDisplayPx 供 pointerInput 协程内读取最新值（rememberUpdatedState 语义）。
+    var displayPx by remember { mutableStateOf(IntSize.Zero) }
+    val currentDisplayPx by rememberUpdatedState(displayPx)
     val ctx = remember { PaintNative }
     val started = remember { ctx.nativeInit(cw, ch) }
     DisposableEffect(Unit) { onDispose { ctx.nativeDestroy() } }
@@ -84,10 +89,27 @@ fun PaintScreen() {
                 .fillMaxSize()
                 .padding(innerPadding)
                 .background(canvasColor)
+                .onSizeChanged { displayPx = it }
                 .pointerInput(Unit) {
                     detectDragGestures(
-                        onDragStart = { offset -> ctx.nativeStrokeBegin(offset.x, offset.y, 0.5f) },
-                        onDrag = { change, _ -> change.consume(); ctx.nativeStrokeTo(change.position.x, change.position.y, 0.5f) },
+                        onDragStart = { offset ->
+                            // 屏幕像素 → 离屏画布坐标，避免笔迹落在 `触摸×屏宽/画布宽` 处
+                            val (cx, cy) = mapScreenToCanvas(
+                                offset.x, offset.y,
+                                currentDisplayPx.width.toFloat(), currentDisplayPx.height.toFloat(),
+                                cw.toFloat(), ch.toFloat(),
+                            )
+                            ctx.nativeStrokeBegin(cx, cy, 0.5f)
+                        },
+                        onDrag = { change, _ ->
+                            change.consume()
+                            val (cx, cy) = mapScreenToCanvas(
+                                change.position.x, change.position.y,
+                                currentDisplayPx.width.toFloat(), currentDisplayPx.height.toFloat(),
+                                cw.toFloat(), ch.toFloat(),
+                            )
+                            ctx.nativeStrokeTo(cx, cy, 0.5f)
+                        },
                         onDragEnd = { ctx.nativeStrokeEnd() },
                     )
                 },
