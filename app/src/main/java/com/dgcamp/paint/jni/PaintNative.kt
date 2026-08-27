@@ -1,5 +1,7 @@
 package com.dgcamp.paint.jni
 
+import java.nio.ByteBuffer
+
 /**
  * native 库的 Kotlin 桥接（消费者自备）。
  *
@@ -16,7 +18,8 @@ object PaintNative {
     external fun nativeStrokeBegin(x: Float, y: Float, pressure: Float)
     external fun nativeStrokeTo(x: Float, y: Float, pressure: Float)
     external fun nativeStrokeEnd()
-    external fun nativeReadback(): ByteArray?
+    external fun nativeFlush()                    // drain 屏障：等 composite 完成
+    external fun nativeReadback(buf: ByteBuffer): Int  // 零分配：直接写进复用 direct buffer
     external fun nativeExportPng(path: String): Boolean
     external fun nativeDestroy()
 

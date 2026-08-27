@@ -44,6 +44,9 @@ fun PaintScreen() {
     var frameMs by remember { mutableFloatStateOf(0f) }
     var readMs by remember { mutableFloatStateOf(0f) }
     var lastError by remember { mutableStateOf("") }
+    // 脏标志：有新输入（gesture 回调置 true）才在下一帧 flush + 读回；空闲帧跳过读回，
+    // 消除每帧 3.1MB 搬运（优化 3：读回移出每帧路径）。初值 true 让首帧上屏清好的画布。
+    var dirty by remember { mutableStateOf(true) }
     // 显示区尺寸（像素），用于把屏幕触摸坐标映射到 1080x720 离屏画布坐标。
     // currentDisplayPx 供 pointerInput 协程内读取最新值（rememberUpdatedState 语义）。
     var displayPx by remember { mutableStateOf(IntSize.Zero) }
@@ -52,23 +55,31 @@ fun PaintScreen() {
     val started = remember { ctx.nativeInit(cw, ch) }
     DisposableEffect(Unit) { onDispose { ctx.nativeDestroy() } }
 
-    // 复用单个 Bitmap，避免每帧 createBitmap 在主线程分配（3MB/帧）造成 GC churn。
+    // 复用单个 Bitmap + 单个 direct ByteBuffer（零分配读回，优化 3）。
+    // direct buffer 由 Java 持有，JNI 经 GetDirectBufferAddress 让 SDK 直接写入其内存，
+    // 消灭每帧 std::vector/NewByteArray/SetByteArrayRegion 的分配与 3.1MB 拷贝。
     val bmp = remember { Bitmap.createBitmap(cw, ch, Bitmap.Config.ARGB_8888) }
+    val rbBuf = remember { ByteBuffer.allocateDirect(cw * ch * 4) }
 
-    // 每帧：readback → 复用 bitmap 更新 → 计算 fps/帧时/读回耗时
+    // 帧循环：仅在 dirty 时 flush（等批量 composite 完成）→ 零分配读回 → 复用 bitmap 上屏。
     LaunchedEffect(Unit) {
-        var frames = 0; var last = System.nanoTime(); var prev = last
+        var frames = 0; var last = System.nanoTime()
         while (true) {
             withFrameNanos { now ->
-                val rb0 = System.nanoTime()
-                val arr = ctx.nativeReadback()
-                val rb1 = System.nanoTime()
-                readMs = (rb1 - rb0) / 1_000_000f
-                if (arr != null) {
-                    bmp.copyPixelsFromBuffer(ByteBuffer.wrap(arr))
-                    bitmap = bmp   // 同一实例，避免重复分配
-                } else {
-                    lastError = "readback failed"
+                if (dirty) {
+                    ctx.nativeFlush()          // drain 屏障：批量 composite 后必须等完成才读到新画布
+                    val rb0 = System.nanoTime()
+                    val rc = ctx.nativeReadback(rbBuf)
+                    val rb1 = System.nanoTime()
+                    readMs = (rb1 - rb0) / 1_000_000f
+                    if (rc == 0) {
+                        rbBuf.rewind()
+                        bmp.copyPixelsFromBuffer(rbBuf)
+                        bitmap = bmp           // 同一实例，避免重复分配
+                        dirty = false
+                    } else {
+                        lastError = "readback failed rc=$rc"
+                    }
                 }
                 frames++
                 if (now - last >= 500_000_000L) {
@@ -93,6 +104,7 @@ fun PaintScreen() {
                 .pointerInput(Unit) {
                     detectDragGestures(
                         onDragStart = { offset ->
+                            dirty = true
                             // 屏幕像素 → 离屏画布坐标，避免笔迹落在 `触摸×屏宽/画布宽` 处
                             val (cx, cy) = mapScreenToCanvas(
                                 offset.x, offset.y,
@@ -103,6 +115,7 @@ fun PaintScreen() {
                         },
                         onDrag = { change, _ ->
                             change.consume()
+                            dirty = true
                             val (cx, cy) = mapScreenToCanvas(
                                 change.position.x, change.position.y,
                                 currentDisplayPx.width.toFloat(), currentDisplayPx.height.toFloat(),
@@ -110,7 +123,10 @@ fun PaintScreen() {
                             )
                             ctx.nativeStrokeTo(cx, cy, 0.5f)
                         },
-                        onDragEnd = { ctx.nativeStrokeEnd() },
+                        onDragEnd = {
+                            dirty = true
+                            ctx.nativeStrokeEnd()
+                        },
                     )
                 },
         ) {

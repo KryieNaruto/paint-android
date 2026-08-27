@@ -4,11 +4,12 @@
 // 唯一 include：dgc_paint_c_api.h（禁止 include core/ 等 SDK 内部头）。
 //
 // 数据流：MotionEvent → JNI → dgcBeginStroke/StrokeTo/EndStroke → dgcRender（引擎线程）
-//        每帧 dgcReadbackPixels 读回 RGBA8 → ImageBitmap 上屏。
+//        有输入时 dgcFlush → dgcReadbackPixels 写进复用 direct ByteBuffer → ImageBitmap 上屏。
+// 性能（优化 3）：读回零分配——由 Java 持有一个复用的 direct ByteBuffer，JNI 用
+// GetDirectBufferAddress 让 SDK 直接写入，消灭每帧 std::vector + NewByteArray +
+// SetByteArrayRegion 的 3.1MB 分配/拷贝/GC churn（app 内 readback 76-80ms → 纯 SDK ~13ms）。
 
 #include <jni.h>
-#include <vector>
-#include <string>
 #include "dgc_paint_c_api.h"
 
 namespace {
@@ -55,15 +56,23 @@ Java_com_dgcamp_paint_jni_PaintNative_nativeStrokeEnd(JNIEnv*, jobject) {
     if (g_sdk) dgcEndStroke(g_sdk);
 }
 
-extern "C" JNIEXPORT jbyteArray JNICALL
-Java_com_dgcamp_paint_jni_PaintNative_nativeReadback(JNIEnv* env, jobject) {
-    if (!g_sdk) return nullptr;
-    std::vector<uint8_t> buf((size_t)g_w * g_h * 4);
-    int rc = dgcReadbackPixels(g_sdk, buf.data());   // 检查返回值
-    if (rc != 0) return nullptr;
-    jbyteArray arr = env->NewByteArray((jsize)buf.size());
-    env->SetByteArrayRegion(arr, 0, (jsize)buf.size(), (const jbyte*)buf.data());
-    return arr;
+// 零分配读回：Java 传入复用的 direct ByteBuffer，SDK 直接写入其内存。
+// 返回 dgcReadbackPixels 的 rc（0=成功）。GetDirectBufferCapacity 防越界。
+extern "C" JNIEXPORT jint JNICALL
+Java_com_dgcamp_paint_jni_PaintNative_nativeReadback(JNIEnv* env, jobject, jobject buf) {
+    if (!g_sdk) return -1;
+    jlong cap = env->GetDirectBufferCapacity(buf);
+    if (cap < (jlong)g_w * g_h * 4) return -3;  // 缓冲过小，防 SDK 越界写
+    void* addr = env->GetDirectBufferAddress(buf);
+    if (!addr) return -2;
+    return dgcReadbackPixels(g_sdk, addr);
+}
+
+// drain 屏障：等引擎把已提交输入全部合批 composite 完。批量 composite 后必须 flush 再读回，
+// 否则渲染线程可能仍在攒批，读回拿到旧画布。
+extern "C" JNIEXPORT void JNICALL
+Java_com_dgcamp_paint_jni_PaintNative_nativeFlush(JNIEnv*, jobject) {
+    if (g_sdk) dgcFlush(g_sdk);
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
