@@ -3,13 +3,30 @@ package com.dgcamp.paint.ui
 import android.graphics.Bitmap
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -19,11 +36,46 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import com.dgcamp.paint.BuildConfig
 import com.dgcamp.paint.jni.PaintNative
 import java.nio.ByteBuffer
+
+/** D6-1 画笔参数滑杆规格：settingId/范围严格取 SDK docs/brush_settings_mapping.md，
+ * 默认值对齐 paint-pc app.cpp（radius 20 / hardness 0.8 / opacity 1.0 / modeler 见映射表）。 */
+private data class BrushSettingSpec(
+    val id: Int,
+    val label: String,
+    val min: Float,
+    val max: Float,
+    val default: Float,
+)
+
+// settingId 0-2（radius/hardness/opacity）当前仅存参、不作用于默认笔刷渲染（映射表注），
+// 保留控件与 PC 一致；4-12 为 stroke modeler 参数（惰性激活，生效于新笔画）。跳过 3
+// （RADIUS_LOG，PC 也未接）。id 与 sdk_api/dgc_paint_c_api.h 的 DgcBrushSetting 枚举一致。
+private val BRUSH_SETTINGS = listOf(
+    BrushSettingSpec(0, "半径 radius", 1f, 100f, 20f),
+    BrushSettingSpec(1, "硬度 hardness", 0f, 1f, 0.8f),
+    BrushSettingSpec(2, "不透明度 opacity", 0f, 1f, 1f),
+    BrushSettingSpec(4, "抖动消除超时 wobble_timeout_ms", 0f, 200f, 40f),
+    BrushSettingSpec(5, "抖动消除最低速度 wobble_speed_floor", 0f, 10f, 1.31f),
+    BrushSettingSpec(6, "最小输出采样率 min_output_rate_hz", 20f, 500f, 180f),
+    BrushSettingSpec(7, "抬笔停止距离 end_of_stroke_stopping_distance_mm", 0.01f, 5f, 0.1f),
+    BrushSettingSpec(8, "弹簧质量常量 spring_mass_constant", 10f, 2000f, 400f),
+    BrushSettingSpec(9, "弹簧阻尼常量 spring_drag_constant", 1f, 200f, 40f),
+    BrushSettingSpec(10, "卡尔曼过程噪声 kalman_process_noise", 0.00001f, 0.01f, 0.0005f),
+    BrushSettingSpec(11, "卡尔曼测量噪声 kalman_measurement_noise", 0.0001f, 0.1f, 0.004f),
+    BrushSettingSpec(12, "预测间隔 prediction_interval_ms", 0f, 100f, 16f),
+)
+
+/** 滑杆读数短格式：整数不带小数，小数值按 decimals 位取整后去尾零。 */
+private fun formatSetting(value: Float, decimals: Int = 3): String {
+    if (value % 1f == 0f) return value.toInt().toString()
+    return "%.${decimals}f".format(value).trimEnd('0').trimEnd('.')
+}
 
 /**
  * 绘画画布（SDK C API 接入）。
@@ -31,6 +83,10 @@ import java.nio.ByteBuffer
  * 数据流：触摸输入 → JNI → dgcBeginStroke/StrokeTo/EndStroke → 引擎渲染 →
  *         每帧 dgcReadbackPixels 读回 RGBA8 → 复用单个 Bitmap → ImageBitmap 上屏。
  * 浮层显示 FPS / 帧时 ms / 读回耗时 ms（spec 验收 #3）。
+ *
+ * D6-1/2/3：右上角「⚙ 参数」开关展开调试面板——画笔参数（12 滑杆）/ 颜色（4 滑杆+预览色块）/
+ * 画布操作（缩放 −/＋/重置 + 清空）。设置/颜色仅在 strokeActive==false（笔画之间）下发，
+ * 缩放经居中视口映射触摸 + 子矩形采样上屏（镜像 PC coords.cpp 语义）。
  *
  * 依赖：B3-1 真实内核未合并时笔迹不可见（Null 内核），本期只验收链路 + FPS 浮层。
  */
@@ -55,6 +111,17 @@ fun PaintScreen() {
     val ctx = remember { PaintNative }
     val started = remember { ctx.nativeInit(cw, ch) }
     DisposableEffect(Unit) { onDispose { ctx.nativeDestroy() } }
+
+    // ── D6-1/2/3 状态 ──
+    var zoom by remember { mutableFloatStateOf(1f) }            // D6-2 缩放（[1,8]，clampZoom）
+    var strokeActive by remember { mutableStateOf(false) }      // 笔画守卫：画中不改参/改色
+    var panelExpanded by remember { mutableStateOf(false) }     // 调试面板默认收起
+    var brushColor by remember { mutableStateOf(floatArrayOf(0f, 0f, 0f, 1f)) }  // D6-3 颜色，初值黑色不透明
+    val settingValues = remember {
+        mutableStateMapOf<Int, Float>().apply { BRUSH_SETTINGS.forEach { put(it.id, it.default) } }
+    }
+    // pointerInput 协程内读取最新 zoom（rememberUpdatedState 语义，与 currentDisplayPx 一致）
+    val currentZoom by rememberUpdatedState(zoom)
 
     // 复用单个 Bitmap + 单个 direct ByteBuffer（零分配读回，优化 3）。
     // direct buffer 由 Java 持有，JNI 经 GetDirectBufferAddress 让 SDK 直接写入其内存，
@@ -109,27 +176,35 @@ fun PaintScreen() {
                 .pointerInput(Unit) {
                     detectDragGestures(
                         onDragStart = { offset ->
+                            strokeActive = true
                             dirty = true
-                            // 屏幕像素 → 离屏画布坐标，避免笔迹落在 `触摸×屏宽/画布宽` 处
-                            val (cx, cy) = mapScreenToCanvas(
+                            // 屏幕像素 → 缩放画布坐标（zoom=1 时退化为未缩放映射）
+                            val (cx, cy) = mapScreenToCanvasZoomed(
                                 offset.x, offset.y,
                                 currentDisplayPx.width.toFloat(), currentDisplayPx.height.toFloat(),
-                                cw.toFloat(), ch.toFloat(),
+                                cw.toFloat(), ch.toFloat(), currentZoom,
                             )
                             ctx.nativeStrokeBegin(cx, cy, 0.5f)
                         },
                         onDrag = { change, _ ->
                             change.consume()
+                            strokeActive = true
                             dirty = true
-                            val (cx, cy) = mapScreenToCanvas(
+                            val (cx, cy) = mapScreenToCanvasZoomed(
                                 change.position.x, change.position.y,
                                 currentDisplayPx.width.toFloat(), currentDisplayPx.height.toFloat(),
-                                cw.toFloat(), ch.toFloat(),
+                                cw.toFloat(), ch.toFloat(), currentZoom,
                             )
                             ctx.nativeStrokeTo(cx, cy, 0.5f)
                         },
                         onDragEnd = {
                             dirty = true
+                            strokeActive = false
+                            ctx.nativeStrokeEnd()
+                        },
+                        onDragCancel = {
+                            dirty = true
+                            strokeActive = false
                             ctx.nativeStrokeEnd()
                         },
                     )
@@ -138,7 +213,21 @@ fun PaintScreen() {
             val bmp = bitmap
             if (bmp != null) {
                 Canvas(modifier = Modifier.fillMaxSize()) {
-                    drawImage(bmp.asImageBitmap(), dstSize = IntSize(this.size.width.toInt(), this.size.height.toInt()))
+                    val img = bmp.asImageBitmap()
+                    val dstW = this.size.width.toInt()
+                    val dstH = this.size.height.toInt()
+                    if (zoom > 1f) {
+                        // D6-2 缩放：只采样居中视口子矩形并放大铺满显示区（等价 PC UV 子矩形）
+                        val (vx, vy, vw, vh) = computeCanvasViewport(cw.toFloat(), ch.toFloat(), zoom)
+                        drawImage(
+                            image = img,
+                            srcOffset = IntOffset(vx.toInt(), vy.toInt()),
+                            srcSize = IntSize(vw.toInt().coerceAtLeast(1), vh.toInt().coerceAtLeast(1)),
+                            dstSize = IntSize(dstW, dstH),
+                        )
+                    } else {
+                        drawImage(img, dstSize = IntSize(dstW, dstH))
+                    }
                 }
             }
             Text(
@@ -155,6 +244,117 @@ fun PaintScreen() {
                 style = MaterialTheme.typography.labelSmall,
                 modifier = Modifier.align(Alignment.BottomEnd).safeDrawingPadding().padding(12.dp),
             )
+            // D6-1/2/3 调试面板开关（右上角）：展开/收起。
+            Text(
+                text = if (panelExpanded) "× 收起" else "⚙ 参数",
+                color = Color.White,
+                style = MaterialTheme.typography.labelMedium,
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .safeDrawingPadding()
+                    .padding(12.dp)
+                    .background(Color(0x66000000), RoundedCornerShape(8.dp))
+                    .clickable { panelExpanded = !panelExpanded }
+                    .padding(horizontal = 10.dp, vertical = 4.dp),
+            )
+
+            // D6-1/2/3 调试面板：画笔参数 12 滑杆 + 颜色 4 滑杆 + 缩放/清空。半透明可滚动，
+            // 默认收起不挡画布。设置/颜色改动仅在 !strokeActive（笔画之间）时下发（复刻 PC）。
+            if (panelExpanded) {
+                Column(
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .safeDrawingPadding()
+                        .padding(top = 56.dp, end = 12.dp)   // 让出右上角开关按钮
+                        .widthIn(max = 420.dp)
+                        .heightIn(max = 640.dp)
+                        .verticalScroll(rememberScrollState())
+                        .background(Color(0xEE242424), RoundedCornerShape(12.dp))
+                        .padding(horizontal = 12.dp, vertical = 10.dp),
+                ) {
+                    Text("画笔参数 (D6-1)", color = Color.White, style = MaterialTheme.typography.titleSmall)
+                    if (strokeActive) {
+                        Text(
+                            "笔画进行中，参数改动会被丢弃",
+                            color = Color(0xFFFFB74D),
+                            style = MaterialTheme.typography.labelSmall,
+                        )
+                    }
+                    BRUSH_SETTINGS.forEach { spec ->
+                        Text(
+                            text = "${spec.label}  ${formatSetting(settingValues.getValue(spec.id), if (spec.max < 1f) 5 else 3)}",
+                            color = Color.White,
+                            style = MaterialTheme.typography.labelSmall,
+                        )
+                        Slider(
+                            value = settingValues.getValue(spec.id),
+                            onValueChange = { v ->
+                                settingValues[spec.id] = v
+                                if (!strokeActive) ctx.nativeSetBrushSetting(spec.id, v.toDouble())
+                            },
+                            valueRange = spec.min..spec.max,
+                        )
+                    }
+                    HorizontalDivider(color = Color(0x66FFFFFF), modifier = Modifier.padding(vertical = 6.dp))
+                    Text("笔刷颜色 (D6-3)", color = Color.White, style = MaterialTheme.typography.titleSmall)
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        // 预览色块 + 读数（Compose 无 ColorEdit4，滑杆+色块是等价替代）
+                        Box(
+                            modifier = Modifier
+                                .size(32.dp)
+                                .background(
+                                    Color(brushColor[0], brushColor[1], brushColor[2], brushColor[3]),
+                                    RoundedCornerShape(6.dp),
+                                ),
+                        )
+                        Spacer(Modifier.width(10.dp))
+                        Text(
+                            "R${formatSetting(brushColor[0])} G${formatSetting(brushColor[1])} " +
+                                "B${formatSetting(brushColor[2])} A${formatSetting(brushColor[3])}",
+                            color = Color.White,
+                            style = MaterialTheme.typography.labelSmall,
+                        )
+                    }
+                    listOf("R" to 0, "G" to 1, "B" to 2, "A" to 3).forEach { (name, idx) ->
+                        Text(name, color = Color.White, style = MaterialTheme.typography.labelSmall)
+                        Slider(
+                            value = brushColor[idx],
+                            onValueChange = { v ->
+                                val next = brushColor.copyOf()
+                                next[idx] = v
+                                brushColor = next          // 换新数组引用，保证状态触发重组
+                                if (!strokeActive) {
+                                    ctx.nativeSetBrushColor(next[0], next[1], next[2], next[3])
+                                }
+                            },
+                            valueRange = 0f..1f,
+                        )
+                    }
+                    HorizontalDivider(color = Color(0x66FFFFFF), modifier = Modifier.padding(vertical = 6.dp))
+                    Text("画布操作 (D6-2)", color = Color.White, style = MaterialTheme.typography.titleSmall)
+                    Text("缩放 %.2fx".format(zoom), color = Color.White, style = MaterialTheme.typography.labelSmall)
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(onClick = { zoom = clampZoom(zoom * 1.25f) }) { Text("＋") }
+                        Button(onClick = { zoom = clampZoom(zoom / 1.25f) }) { Text("－") }
+                        Button(onClick = { zoom = 1f }) { Text("重置") }
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    // 清空顺序为正确性关键（与 PC D6-2 一致）：
+                    //   1) 若有进行中笔画先强制结束，避免半笔画残留
+                    //   2) nativeFlush 排空已提交未合成的笔画（反序会 clear 后残留笔迹回写）
+                    //   3) nativeClear 清成纸白（与 nativeInit 初始色一致）
+                    //   4) dirty=true 让帧循环下一次读回拿到干净画布（无需额外读回）
+                    Button(
+                        onClick = {
+                            if (strokeActive) { ctx.nativeStrokeEnd(); strokeActive = false }
+                            ctx.nativeFlush()
+                            ctx.nativeClear(0.96f, 0.95f, 0.91f, 1.0f)
+                            dirty = true
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFB71C1C)),
+                    ) { Text("清空画布") }
+                }
+            }
         }
     }
 }

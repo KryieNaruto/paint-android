@@ -44,4 +44,43 @@ class CoordsTest {
         assertEquals(0f to 0f, mapScreenToCanvas(1f, 1f, 100f, 100f, 0f, 50f))
         assertEquals(0f to 0f, mapScreenToCanvas(1f, 1f, 100f, 100f, 50f, -50f))
     }
+
+    // ── 缩放视口（D6-2）──
+
+    // clampZoom 边界：<1 收敛到 1，>8 收敛到 8，区间内原样。
+    @Test
+    fun `clamp zoom bounds`() {
+        assertEquals(ZOOM_MIN, clampZoom(0f), 0f)
+        assertEquals(ZOOM_MIN, clampZoom(-3f), 0f)
+        assertEquals(ZOOM_MAX, clampZoom(99f), 0f)
+        assertEquals(2f, clampZoom(2f), 0f)
+    }
+
+    // computeCanvasViewport：zoom=1 → 整张画布；zoom=2 → 1/4 面积且居中。
+    @Test
+    fun `viewport centered and shrinks with zoom`() {
+        val full = computeCanvasViewport(1080f, 720f, 1f)
+        assertEquals(0f, full[0], 0f); assertEquals(0f, full[1], 0f)
+        assertEquals(1080f, full[2], 0f); assertEquals(720f, full[3], 0f)
+
+        val half = computeCanvasViewport(1080f, 720f, 2f)
+        assertEquals(540f, half[2], 0f); assertEquals(360f, half[3], 0f)
+        // 居中：视口中心 == 画布中心 (540,360)
+        assertEquals(540f, half[0] + half[2] / 2f, 0.02f)
+        assertEquals(360f, half[1] + half[3] / 2f, 0.02f)
+        // 视口面积 = 画布 / zoom²
+        assertEquals(1080f * 720f / 4f, half[2] * half[3], 0.02f)
+    }
+
+    // mapScreenToCanvasZoomed：zoom=1 时与 mapScreenToCanvas 完全一致（无缩放回归）。
+    @Test
+    fun `zoomed mapping at zoom one equals unzoomed`() {
+        val pts = listOf(0f to 0f, 100f to 200f, 3240f to 2160f)
+        for ((x, y) in pts) {
+            val unzoomed = mapScreenToCanvas(x, y, 3240f, 2160f, 1080f, 720f)
+            val zoomed = mapScreenToCanvasZoomed(x, y, 3240f, 2160f, 1080f, 720f, 1f)
+            assertEquals(unzoomed.first, zoomed.first, 0.02f)
+            assertEquals(unzoomed.second, zoomed.second, 0.02f)
+        }
+    }
 }

@@ -75,6 +75,28 @@ Java_com_dgcamp_paint_jni_PaintNative_nativeFlush(JNIEnv*, jobject) {
     if (g_sdk) dgcFlush(g_sdk);
 }
 
+// ── D6-1/D6-2/D6-3 消费端接线：笔刷参数 / 颜色 / 清屏 ──
+// 全部固定用 DGC_DEFAULT_BRUSH——PC 端验证过 0-2 号 setting 用自建 handle 是死存储、
+// 4-12 号 modeler 参数是与 handle 值无关的 context 级单例，直接用默认笔刷句柄最简单，
+// 与 PC D6-3 的颜色调用方式一致（dgc_paint_c_api.h DGC_DEFAULT_BRUSH 注释）。
+extern "C" JNIEXPORT jint JNICALL
+Java_com_dgcamp_paint_jni_PaintNative_nativeSetBrushSetting(JNIEnv*, jobject, jint settingId, jdouble value) {
+    if (!g_sdk) return -1;
+    return dgcSetBrushSetting(g_sdk, DGC_DEFAULT_BRUSH, settingId, value);
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_dgcamp_paint_jni_PaintNative_nativeSetBrushColor(JNIEnv*, jobject, jfloat r, jfloat g, jfloat b, jfloat a) {
+    if (!g_sdk) return -1;
+    return dgcSetBrushColor(g_sdk, DGC_DEFAULT_BRUSH, r, g, b, a);
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_dgcamp_paint_jni_PaintNative_nativeClear(JNIEnv*, jobject, jfloat r, jfloat g, jfloat b, jfloat a) {
+    if (!g_sdk) return -1;
+    return dgcClear(g_sdk, r, g, b, a);
+}
+
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_dgcamp_paint_jni_PaintNative_nativeExportPng(JNIEnv* env, jobject, jstring path) {
     if (!g_sdk) return JNI_FALSE;

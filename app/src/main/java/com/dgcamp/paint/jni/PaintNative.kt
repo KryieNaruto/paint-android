@@ -22,6 +22,10 @@ object PaintNative {
     external fun nativeReadback(buf: ByteBuffer): Int  // 零分配：直接写进复用 direct buffer
     external fun nativeExportPng(path: String): Boolean
     external fun nativeDestroy()
+    // D6-1/D6-2/D6-3 消费端接线：笔刷参数 / 颜色 / 清屏（JNI 侧固定用 DGC_DEFAULT_BRUSH）
+    external fun nativeSetBrushSetting(settingId: Int, value: Double): Int
+    external fun nativeSetBrushColor(r: Float, g: Float, b: Float, a: Float): Int
+    external fun nativeClear(r: Float, g: Float, b: Float, a: Float): Int
 
     fun init(w: Int, h: Int): Boolean = nativeInit(w, h)
 }
