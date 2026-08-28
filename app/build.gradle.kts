@@ -4,6 +4,23 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
+// 版本号取 git short SHA（SDK 无自带版本 API，git commit 是唯一可靠版本标识）：
+// appGitSha = 消费者仓库（paint-android）自身 HEAD；sdkGitSha = sdk/ submodule 实际签出的 HEAD
+// （非 superproject 记录的 gitlink——submodule 用 --remote 跟随 SDK main 最新，实际签出可能领先于 gitlink）。
+fun gitShortSha(dir: File): String = try {
+    val proc = ProcessBuilder("git", "rev-parse", "--short", "HEAD")
+        .directory(dir)
+        .redirectErrorStream(true)
+        .start()
+    val out = proc.inputStream.bufferedReader().readText().trim()
+    if (proc.waitFor() == 0 && out.isNotEmpty()) out else "unknown"
+} catch (e: Exception) {
+    "unknown"
+}
+
+val appGitSha = gitShortSha(rootDir)
+val sdkGitSha = gitShortSha(File(rootDir, "sdk"))
+
 android {
     namespace = "com.dgcamp.paint"
     compileSdk = 35
@@ -20,6 +37,9 @@ android {
         targetSdk = 35
         versionCode = 1
         versionName = "0.1.0"
+
+        buildConfigField("String", "APP_GIT_SHA", "\"$appGitSha\"")
+        buildConfigField("String", "SDK_GIT_SHA", "\"$sdkGitSha\"")
 
         // 消费者 JNI 库：externalNativeBuild 用根 CMakeLists.txt 构建 paint_android_jni。
         externalNativeBuild {
@@ -67,6 +87,7 @@ android {
 
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 
     // 消费仓库的 SDK submodule 构建产物不进 git。

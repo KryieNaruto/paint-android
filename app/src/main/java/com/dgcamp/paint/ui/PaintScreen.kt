@@ -21,6 +21,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
+import com.dgcamp.paint.BuildConfig
 import com.dgcamp.paint.jni.PaintNative
 import java.nio.ByteBuffer
 
@@ -142,6 +143,13 @@ fun PaintScreen() {
                 color = overlayColor,
                 style = MaterialTheme.typography.bodyLarge,
                 modifier = Modifier.align(Alignment.TopStart).safeDrawingPadding().padding(12.dp),
+            )
+            // 版本号：SDK 无自带版本 API，取 sdk submodule 实际签出 HEAD + 消费者自身 HEAD 的 git short SHA。
+            Text(
+                text = "sdk ${BuildConfig.SDK_GIT_SHA} · app ${BuildConfig.APP_GIT_SHA}",
+                color = overlayColor,
+                style = MaterialTheme.typography.labelSmall,
+                modifier = Modifier.align(Alignment.BottomEnd).safeDrawingPadding().padding(12.dp),
             )
         }
     }
