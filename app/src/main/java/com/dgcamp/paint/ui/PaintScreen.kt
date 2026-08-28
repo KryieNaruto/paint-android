@@ -68,7 +68,11 @@ fun PaintScreen() {
         while (true) {
             withFrameNanos { now ->
                 if (dirty) {
-                    ctx.nativeFlush()          // drain 屏障：批量 composite 后必须等完成才读到新画布
+                    // P7-2：不再显式调用阻塞 nativeFlush()——nativeReadback 内部的
+                    // dgcReadbackPixels 已经会对渲染线程做非阻塞 catch-up（P7-1 起，
+                    // P7-2 增加节流避免打散批量 composite），显式先 flush 再读回是
+                    // 重复且阻塞的（此前 Android 7fps 回归根因，见
+                    // docs/tasks/detail/PC-Android真机性能瓶颈修复.md 背景）。
                     val rb0 = System.nanoTime()
                     val rc = ctx.nativeReadback(rbBuf)
                     val rb1 = System.nanoTime()
