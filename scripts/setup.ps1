@@ -7,12 +7,13 @@
       1) 探测  JDK≥17 / Android SDK / NDK 28 / git；
       2) 补缺  硬依赖缺失给精确安装指引（sdkmanager / Android Studio / JDK 下载），
               并提示写 local.properties；
-      3) 拉取  git submodule update --remote（SDK 跟随 paintDemo main 最新，不钉 pin）；
+      3) 拉取  git pull --ff-only（主仓库自身）+ git submodule update --remote（SDK 跟随
+              paintDemo main 最新，不钉 pin）；
       4) 构建  .\gradlew.bat assembleDebug（arm64-v8a + 真实 Vulkan 后端）；
       5) 测试  --test 模式 = assembleDebug 编译门 + DemoExport 离屏自检代码审读。
 
     用法（PowerShell 5.1+ / Core 7+）:
-      .\scripts\setup.ps1              默认（开发）：探测+补缺指引+拉 submodule+构建 APK
+      .\scripts\setup.ps1              默认（开发）：探测+补缺指引+拉主仓库+拉 submodule+构建 APK
       .\scripts\setup.ps1 --check      只探测不安装，输出缺项清单
       .\scripts\setup.ps1 --test       探测+构建+测试门
       .\scripts\setup.ps1 -Help        打印本帮助
@@ -137,6 +138,50 @@ function Print-Guidance {
     Info "  - git: https://git-scm.com/download/win"
 }
 
+# 拉取本仓库自身（paint-android）最新提交。只做 fast-forward，绝不自动 merge/rebase——
+# 教训：脚本曾经只拉 SDK submodule，主仓库从不更新，导致本机代码与远端悄悄脱节而不自知。
+# 工作区不干净（未提交改动 / 未解决冲突）或本地已分叉时直接报错退出，不静默产生冲突。
+function Sync-Repo {
+    param([string]$R)
+    Push-Location $R
+    try {
+        if (-not (Test-Path (Join-Path $R ".git"))) {
+            Warn "非 git 仓库（$R\.git 不存在），跳过主仓库同步。"
+            return
+        }
+
+        Info "同步 paint-android 主仓库（git pull --ff-only）…"
+
+        $dirty = & git status --porcelain=v1
+        if ($LASTEXITCODE -ne 0) { Err "git status 失败"; exit 1 }
+        if ($dirty) {
+            Err "工作区不干净（有未提交修改或未解决的合并冲突），为避免破坏本地改动，跳过自动 pull。"
+            & git status --short
+            Err "请先 git add/commit 或 git stash，若已有冲突先 git status 解决，再重跑本脚本。"
+            exit 1
+        }
+
+        $branch = & git symbolic-ref --short -q HEAD
+        if (-not $branch) {
+            Warn "当前处于 detached HEAD，跳过自动 pull（可能是 CI / 浅克隆场景）。"
+            return
+        }
+
+        & git fetch origin $branch
+        if ($LASTEXITCODE -ne 0) { Err "git fetch 失败"; exit 1 }
+        & git merge --ff-only "origin/$branch"
+        if ($LASTEXITCODE -ne 0) {
+            Err "本地分支 $branch 与 origin/$branch 已分叉（存在本地未推送的提交），本脚本不做自动合并/变基。"
+            Err "请手动执行 git pull（自行决定 merge 还是 rebase）后重跑。"
+            exit 1
+        }
+        Ok "主仓库已同步到 origin/$branch 最新。"
+    }
+    finally {
+        Pop-Location
+    }
+}
+
 function Sync-Submodule {
     param([string]$R)
     Info "同步 SDK submodule（跟随 paintDemo main 最新）…"
@@ -166,6 +211,7 @@ Print-Check
 if ($Check) { if ($script:HardMiss -gt 0) { Print-Guidance; exit 1 }; exit 0 }
 if ($script:HardMiss -gt 0) { Print-Guidance; Err "硬依赖缺失 $($script:HardMiss) 项。请按指引补缺后重跑。"; exit 1 }
 
+Sync-Repo $Root
 Sync-Submodule $Root
 Build-Apk $Root
 

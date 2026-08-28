@@ -3,7 +3,7 @@
 # setup.sh — paint-android 消费者一键环境搭建脚本（W3，Bash / Linux-macOS / Git Bash）
 #
 # 用法:
-#   scripts/setup.sh            默认（开发）模式：探测 + 补缺指引 + 拉 submodule + 构建 APK
+#   scripts/setup.sh            默认（开发）模式：探测 + 补缺指引 + 拉主仓库 + 拉 submodule + 构建 APK
 #   scripts/setup.sh --check    只探测不安装，输出缺项清单
 #   scripts/setup.sh --test     探测 + 构建 + 跑测试门（assembleDebug 编译门 + DemoExport 审读）
 #   scripts/setup.sh --help     打印用法
@@ -154,7 +154,7 @@ print_help() {
   一键搭建 paint-android 开发/测试环境（仓库内自包含）。
 
 模式:
-  （默认） 探测 + 补缺指引 + 拉 SDK submodule + ./gradlew assembleDebug 构建 APK
+  （默认） 探测 + 补缺指引 + 拉主仓库(ff-only) + 拉 SDK submodule + ./gradlew assembleDebug 构建 APK
   --check  只探测不安装，输出缺项清单；硬依赖缺失时非零退出
   --test   探测 + 构建 + 测试门（assembleDebug 编译门 + DemoExport 离屏自检审读）
   --help   打印本帮助
@@ -165,6 +165,41 @@ EOF
 }
 
 # ---------- 动作 ----------
+# 拉取本仓库自身（paint-android）最新提交。只做 fast-forward，绝不自动 merge/rebase——
+# 教训：脚本曾经只拉 SDK submodule，主仓库从不更新，导致本机代码与远端悄悄脱节而不自知。
+# 工作区不干净（未提交改动 / 未解决冲突）或本地已分叉时直接报错退出，不静默产生冲突。
+sync_repo() {
+  local root="$1" branch
+
+  if [ ! -d "$root/.git" ]; then
+    warn "非 git 仓库（$root/.git 不存在），跳过主仓库同步。"
+    return 0
+  fi
+
+  info "同步 paint-android 主仓库（git pull --ff-only）…"
+
+  if [ -n "$(git -C "$root" status --porcelain=v1 2>/dev/null)" ]; then
+    err "工作区不干净（有未提交修改或未解决的合并冲突），为避免破坏本地改动，跳过自动 pull。"
+    git -C "$root" status --short
+    err "请先 git add/commit 或 git stash，若已有冲突先 git status 解决，再重跑本脚本。"
+    exit 1
+  fi
+
+  branch="$(git -C "$root" symbolic-ref --short -q HEAD || true)"
+  if [ -z "$branch" ]; then
+    warn "当前处于 detached HEAD，跳过自动 pull（可能是 CI / 浅克隆场景）。"
+    return 0
+  fi
+
+  git -C "$root" fetch origin "$branch"
+  if ! git -C "$root" merge --ff-only "origin/$branch"; then
+    err "本地分支 $branch 与 origin/$branch 已分叉（存在本地未推送的提交），本脚本不做自动合并/变基。"
+    err "请手动执行 git pull（自行决定 merge 还是 rebase）后重跑。"
+    exit 1
+  fi
+  ok "主仓库已同步到 origin/$branch 最新。"
+}
+
 sync_submodule() {
   local root="$1"
   info "同步 SDK submodule（跟随 paintDemo main 最新）…"
@@ -222,6 +257,7 @@ main() {
     exit 1
   fi
 
+  sync_repo "$root"
   sync_submodule "$root"
   fetch_deps "$root"
   build_apk "$root"
