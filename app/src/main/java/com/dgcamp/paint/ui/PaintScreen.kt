@@ -53,9 +53,11 @@ private data class BrushSettingSpec(
     val default: Float,
 )
 
-// settingId 0-2（radius/hardness/opacity）当前仅存参、不作用于默认笔刷渲染（映射表注），
-// 保留控件与 PC 一致；4-12 为 stroke modeler 参数（惰性激活，生效于新笔画）。跳过 3
-// （RADIUS_LOG，PC 也未接）。id 与 sdk_api/dgc_paint_c_api.h 的 DgcBrushSetting 枚举一致。
+// settingId 0-2（radius/hardness/opacity）自 SDK bugfix 起经内核 Brush::setBase 实时生效于
+// 下一笔 stroke（映射表注，笔画之间生效），保留控件与 PC 一致；4-12 为 stroke modeler 参数
+// （惰性激活，生效于新笔画）。跳过 3（RADIUS_LOG，PC 也未接）。id 与 sdk_api/dgc_paint_c_api.h
+// 的 DgcBrushSetting 枚举一致。spring 默认值对齐 SDK 新默认（K/m=40000、C/m=400，ωn=200 rad/s
+// 临界阻尼，见 core/stroke_predictor.h bugfix Fix B 校准依据）。
 private val BRUSH_SETTINGS = listOf(
     BrushSettingSpec(0, "半径 radius", 1f, 100f, 20f),
     BrushSettingSpec(1, "硬度 hardness", 0f, 1f, 0.8f),
@@ -64,8 +66,8 @@ private val BRUSH_SETTINGS = listOf(
     BrushSettingSpec(5, "抖动消除最低速度 wobble_speed_floor", 0f, 10f, 1.31f),
     BrushSettingSpec(6, "最小输出采样率 min_output_rate_hz", 20f, 500f, 180f),
     BrushSettingSpec(7, "抬笔停止距离 end_of_stroke_stopping_distance_mm", 0.01f, 5f, 0.1f),
-    BrushSettingSpec(8, "弹簧质量常量 spring_mass_constant", 10f, 2000f, 400f),
-    BrushSettingSpec(9, "弹簧阻尼常量 spring_drag_constant", 1f, 200f, 40f),
+    BrushSettingSpec(8, "弹簧质量常量 spring_mass_constant", 1000f, 100000f, 40000f),
+    BrushSettingSpec(9, "弹簧阻尼常量 spring_drag_constant", 10f, 2000f, 400f),
     BrushSettingSpec(10, "卡尔曼过程噪声 kalman_process_noise", 0.00001f, 0.01f, 0.0005f),
     BrushSettingSpec(11, "卡尔曼测量噪声 kalman_measurement_noise", 0.0001f, 0.1f, 0.004f),
     BrushSettingSpec(12, "预测间隔 prediction_interval_ms", 0f, 100f, 16f),
