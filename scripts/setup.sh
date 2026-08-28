@@ -3,7 +3,7 @@
 # setup.sh — paint-android 消费者一键环境搭建脚本（W3，Bash / Linux-macOS / Git Bash）
 #
 # 用法:
-#   scripts/setup.sh            默认（开发）模式：探测 + 补缺指引 + 拉主仓库 + 拉 submodule + 构建 APK
+#   scripts/setup.sh            默认（开发）模式：探测 + 补缺指引 + 拉主仓库 + 拉 submodule + 构建 + adb 装最新 APK
 #   scripts/setup.sh --check    只探测不安装，输出缺项清单
 #   scripts/setup.sh --test     探测 + 构建 + 跑测试门（assembleDebug 编译门 + DemoExport 审读）
 #   scripts/setup.sh --help     打印用法
@@ -155,6 +155,7 @@ print_help() {
 
 模式:
   （默认） 探测 + 补缺指引 + 拉主仓库(ff-only) + 拉 SDK submodule + ./gradlew assembleDebug 构建 APK
+           + 有设备/模拟器时 adb install -r 覆盖安装并启动（绕开 Android Studio 自身部署缓存）
   --check  只探测不安装，输出缺项清单；硬依赖缺失时非零退出
   --test   探测 + 构建 + 测试门（assembleDebug 编译门 + DemoExport 离屏自检审读）
   --help   打印本帮助
@@ -226,6 +227,60 @@ build_apk() {
   (cd "$root" && ./gradlew assembleDebug --no-daemon)
 }
 
+# 找 adb：优先 PATH，其次 local.properties 的 sdk.dir（复用 resolve_sdk_dir 的转义解析），
+# 找不到就返回非 0，调用方按软失败处理（不阻断构建）。
+find_adb() {
+  local sdkdir="" cand
+  has adb && { printf 'adb'; return 0; }
+  sdkdir="$(resolve_sdk_dir)"
+  [ -z "$sdkdir" ] && sdkdir="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+  [ -z "$sdkdir" ] && return 1
+  for cand in "$sdkdir/platform-tools/adb" "$sdkdir/platform-tools/adb.exe"; do
+    [ -x "$cand" ] && { printf '%s' "$cand"; return 0; }
+  done
+  return 1
+}
+
+# 构建产物直接 adb install -r 覆盖安装 + 启动，绕开 Android Studio 自身的增量部署/构建缓存——
+# 教训：命令行 git pull + gradlew 构建出的最新 APK，若靠 AS 的 Run/Apply Changes 部署，
+# AS 有时仍沿用它自己缓存的旧构建产物，认不到命令行外部改动，导致「代码明明改了、App 却没变」。
+# 找不到 adb 或没接设备/模拟器时只警告跳过，不阻断（本次仅完成构建，部署留人工 adb install）。
+install_apk() {
+  local root="$1"
+  local apk="$root/app/build/outputs/apk/debug/app-debug.apk"
+  local pkg="com.dgcamp.paint"
+  local adb_bin devices dev
+
+  if [ ! -f "$apk" ]; then
+    warn "未找到构建产物 $apk，跳过自动安装。"
+    return 0
+  fi
+
+  if ! adb_bin="$(find_adb)"; then
+    warn "未找到 adb（不在 PATH 也不在 SDK platform-tools 下），跳过自动安装。"
+    return 0
+  fi
+
+  devices="$("$adb_bin" devices | awk 'NR>1 && $2=="device" {print $1}')"
+  if [ -z "$devices" ]; then
+    warn "未检测到已连接的设备/模拟器，跳过自动安装（本次仅完成构建，未部署）。"
+    return 0
+  fi
+
+  info "检测到设备，adb install -r 覆盖安装最新 APK（绕开 IDE 缓存）…"
+  while IFS= read -r dev; do
+    [ -z "$dev" ] && continue
+    if "$adb_bin" -s "$dev" install -r "$apk" >/dev/null; then
+      ok "已安装到 $dev"
+      "$adb_bin" -s "$dev" shell am start -n "$pkg/.MainActivity" >/dev/null 2>&1 \
+        && ok "已在 $dev 上启动 $pkg" \
+        || warn "$dev 启动失败（可手动打开 App）"
+    else
+      warn "$dev 安装失败，请手动执行：$adb_bin -s $dev install -r \"$apk\""
+    fi
+  done <<< "$devices"
+}
+
 # ---------- 主流程 ----------
 main() {
   local mode="dev"
@@ -261,6 +316,7 @@ main() {
   sync_submodule "$root"
   fetch_deps "$root"
   build_apk "$root"
+  install_apk "$root"
 
   if [ "$mode" = "test" ]; then
     info "测试门：assembleDebug 编译门已通过。DemoExport 离屏自检（exported=true + nativeExportPng→dgcExportPNG）代码审读："

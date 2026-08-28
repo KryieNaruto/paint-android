@@ -10,7 +10,8 @@
       3) 拉取  git pull --ff-only（主仓库自身）+ git submodule update --remote（SDK 跟随
               paintDemo main 最新，不钉 pin）；
       4) 构建  .\gradlew.bat assembleDebug（arm64-v8a + 真实 Vulkan 后端）；
-      5) 测试  --test 模式 = assembleDebug 编译门 + DemoExport 离屏自检代码审读。
+      5) 部署  有设备/模拟器时 adb install -r 覆盖安装并启动（绕开 Android Studio 自身部署缓存）；
+      6) 测试  --test 模式 = assembleDebug 编译门 + DemoExport 离屏自检代码审读。
 
     用法（PowerShell 5.1+ / Core 7+）:
       .\scripts\setup.ps1              默认（开发）：探测+补缺指引+拉主仓库+拉 submodule+构建 APK
@@ -202,6 +203,80 @@ function Build-Apk {
     Ok "构建产物: app\build\outputs\apk\debug\app-debug.apk"
 }
 
+# 解析 local.properties 的 sdk.dir，反转义 Android Studio 写入的 java.util.Properties
+# 转义（sdk.dir=C\:\\Users\\...）：先合并双反斜杠，再还原冒号转义。
+function Resolve-SdkDir {
+    param([string]$R)
+    $f = Join-Path $R "local.properties"
+    if (-not (Test-Path $f)) { return $null }
+    $line = Get-Content $f | Where-Object { $_ -match '^sdk\.dir=' } | Select-Object -First 1
+    if (-not $line) { return $null }
+    $v = $line -replace '^sdk\.dir=', ''
+    $v = $v -replace '\\\\', '\'
+    $v = ($v -replace '\\:', ':').Trim()
+    if ($v) { return $v }
+    return $null
+}
+
+function Find-Adb {
+    param([string]$R)
+    $cmd = Get-Command adb -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+
+    $sdkDir = Resolve-SdkDir $R
+    if (-not $sdkDir) { $sdkDir = $env:ANDROID_SDK_ROOT }
+    if (-not $sdkDir) { $sdkDir = $env:ANDROID_HOME }
+    if (-not $sdkDir -and $env:LOCALAPPDATA) {
+        $cand = Join-Path $env:LOCALAPPDATA "Android\Sdk"
+        if (Test-Path $cand) { $sdkDir = $cand }
+    }
+    if ($sdkDir) {
+        $adbPath = Join-Path $sdkDir "platform-tools\adb.exe"
+        if (Test-Path $adbPath) { return $adbPath }
+    }
+    return $null
+}
+
+# 构建产物直接 adb install -r 覆盖安装 + 启动，绕开 Android Studio 自身的增量部署/构建缓存——
+# 教训：命令行 git pull + gradlew 构建出的最新 APK，若靠 AS 的 Run/Apply Changes 部署，
+# AS 有时仍沿用它自己缓存的旧构建产物，认不到命令行外部改动，导致「代码明明改了、App 却没变」。
+# 找不到 adb 或没接设备/模拟器时只警告跳过，不阻断（本次仅完成构建，部署留人工 adb install）。
+function Install-Apk {
+    param([string]$R)
+    $apk = Join-Path $R "app\build\outputs\apk\debug\app-debug.apk"
+    $pkg = "com.dgcamp.paint"
+
+    if (-not (Test-Path $apk)) {
+        Warn "未找到构建产物 $apk，跳过自动安装。"
+        return
+    }
+
+    $adbBin = Find-Adb $R
+    if (-not $adbBin) {
+        Warn "未找到 adb（不在 PATH 也不在 SDK platform-tools 下），跳过自动安装。"
+        return
+    }
+
+    $devicesOut = & $adbBin devices
+    $devices = $devicesOut | Select-Object -Skip 1 | Where-Object { $_ -match '\bdevice$' } | ForEach-Object { ($_ -split '\s+')[0] }
+    if (-not $devices) {
+        Warn "未检测到已连接的设备/模拟器，跳过自动安装（本次仅完成构建，未部署）。"
+        return
+    }
+
+    Info "检测到设备，adb install -r 覆盖安装最新 APK（绕开 IDE 缓存）…"
+    foreach ($dev in $devices) {
+        & $adbBin -s $dev install -r $apk
+        if ($LASTEXITCODE -eq 0) {
+            Ok "已安装到 $dev"
+            & $adbBin -s $dev shell am start -n "$pkg/.MainActivity" | Out-Null
+            if ($LASTEXITCODE -eq 0) { Ok "已在 $dev 上启动 $pkg" } else { Warn "$dev 启动失败（可手动打开 App）" }
+        } else {
+            Warn "$dev 安装失败，请手动执行：$adbBin -s $dev install -r `"$apk`""
+        }
+    }
+}
+
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Root = Split-Path -Parent $Root
 
@@ -214,6 +289,7 @@ if ($script:HardMiss -gt 0) { Print-Guidance; Err "硬依赖缺失 $($script:Har
 Sync-Repo $Root
 Sync-Submodule $Root
 Build-Apk $Root
+Install-Apk $Root
 
 if ($Test) {
     Info "测试门：assembleDebug 编译门已通过。DemoExport 离屏自检（exported=true + nativeExportPng→dgcExportPNG）代码审读："
