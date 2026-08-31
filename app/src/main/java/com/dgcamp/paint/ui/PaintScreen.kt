@@ -39,18 +39,22 @@ import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.dgcamp.paint.BuildConfig
 import com.dgcamp.paint.jni.PaintNative
 import java.nio.ByteBuffer
 
 /** D6-1 画笔参数滑杆规格：settingId/范围严格取 SDK docs/brush_settings_mapping.md，
- * 默认值对齐 paint-pc app.cpp（radius 20 / hardness 0.8 / opacity 1.0 / modeler 见映射表）。 */
-private data class BrushSettingSpec(
+ * 默认值对齐 paint-pc app.cpp（radius 20 / hardness 0.8 / opacity 1.0 / modeler 见映射表）。
+ * effect：面向用户的通俗效果说明（Bug #2）——modeler（id>=4）逐条取自映射表
+ * 「改参效果（人工可辨）」列；0-2 注明生效时机。渲染为滑杆 label 下方的次级说明文本。 */
+internal data class BrushSettingSpec(
     val id: Int,
     val label: String,
     val min: Float,
     val max: Float,
     val default: Float,
+    val effect: String,
 )
 
 // settingId 0-2（radius/hardness/opacity）自 SDK bugfix 起经内核 Brush::setBase 实时生效于
@@ -58,19 +62,22 @@ private data class BrushSettingSpec(
 // （惰性激活，生效于新笔画）。跳过 3（RADIUS_LOG，PC 也未接）。id 与 sdk_api/dgc_paint_c_api.h
 // 的 DgcBrushSetting 枚举一致。spring 默认值对齐 SDK 新默认（K/m=40000、C/m=400，ωn=200 rad/s
 // 临界阻尼，见 core/stroke_predictor.h bugfix Fix B 校准依据）。
-private val BRUSH_SETTINGS = listOf(
-    BrushSettingSpec(0, "半径 radius", 1f, 100f, 20f),
-    BrushSettingSpec(1, "硬度 hardness", 0f, 1f, 0.8f),
-    BrushSettingSpec(2, "不透明度 opacity", 0f, 1f, 1f),
-    BrushSettingSpec(4, "抖动消除超时 wobble_timeout_ms", 0f, 200f, 40f),
-    BrushSettingSpec(5, "抖动消除最低速度 wobble_speed_floor", 0f, 10f, 1.31f),
-    BrushSettingSpec(6, "最小输出采样率 min_output_rate_hz", 20f, 500f, 180f),
-    BrushSettingSpec(7, "抬笔停止距离 end_of_stroke_stopping_distance_mm", 0.01f, 5f, 0.1f),
-    BrushSettingSpec(8, "弹簧质量常量 spring_mass_constant", 1000f, 100000f, 40000f),
-    BrushSettingSpec(9, "弹簧阻尼常量 spring_drag_constant", 10f, 2000f, 400f),
-    BrushSettingSpec(10, "卡尔曼过程噪声 kalman_process_noise", 0.00001f, 0.01f, 0.0005f),
-    BrushSettingSpec(11, "卡尔曼测量噪声 kalman_measurement_noise", 0.0001f, 0.1f, 0.004f),
-    BrushSettingSpec(12, "预测间隔 prediction_interval_ms", 0f, 100f, 16f),
+internal val BRUSH_SETTINGS = listOf(
+    // 0-2：笔刷内核基础参数（bugfix 起经内核 setBase 实时生效于下一笔 stroke），effect 注明生效时机。
+    BrushSettingSpec(0, "半径 radius", 1f, 100f, 20f, "越大笔触越粗；改动在下一笔生效"),
+    BrushSettingSpec(1, "硬度 hardness", 0f, 1f, 0.8f, "越大边缘越实、笔触越硬；改动在下一笔生效"),
+    BrushSettingSpec(2, "不透明度 opacity", 0f, 1f, 1f, "越大颜色越浓、越不透明；改动在下一笔生效"),
+    // 4-12：stroke modeler 参数（惰性激活，生效于新笔画）。effect 逐条取自
+    // sdk/docs/brush_settings_mapping.md「改参效果（人工可辨）」列（Bug #2）。
+    BrushSettingSpec(4, "抖动消除超时 wobble_timeout_ms", 0f, 200f, 40f, "越大越平滑但越迟滞跟手"),
+    BrushSettingSpec(5, "抖动消除最低速度 wobble_speed_floor", 0f, 10f, 1.31f, "越大越容易判定为静止抖动而被压平"),
+    BrushSettingSpec(6, "最小输出采样率 min_output_rate_hz", 20f, 500f, 180f, "越大补点越密、曲线越平滑，也决定预测点间距"),
+    BrushSettingSpec(7, "抬笔停止距离 end_of_stroke_stopping_distance_mm", 0.01f, 5f, 0.1f, "越大末端预测点越倾向继续外推"),
+    BrushSettingSpec(8, "弹簧质量常量 spring_mass_constant", 1000f, 100000f, 40000f, "越大响应越快、越跟手"),
+    BrushSettingSpec(9, "弹簧阻尼常量 spring_drag_constant", 10f, 2000f, 400f, "越大抑制过冲越强、运动越粘滞"),
+    BrushSettingSpec(10, "卡尔曼过程噪声 kalman_process_noise", 0.00001f, 0.01f, 0.0005f, "越大越信任最新输入，速度估计更灵敏但更抖"),
+    BrushSettingSpec(11, "卡尔曼测量噪声 kalman_measurement_noise", 0.0001f, 0.1f, 0.004f, "越大越不信任单次量测，估计速度越平滑但滞后"),
+    BrushSettingSpec(12, "预测间隔 prediction_interval_ms", 0f, 100f, 16f, "越大预测点越远，越易见抢跑漂移"),
 )
 
 /** 滑杆读数短格式：整数不带小数，小数值按 decimals 位取整后去尾零。 */
@@ -282,11 +289,26 @@ fun PaintScreen() {
                             style = MaterialTheme.typography.labelSmall,
                         )
                     }
+                    // Bug #2：Stroke Modeler 白话引导——用户不知道 4-12 这些 modeler 滑杆干什么。
+                    Text(
+                        text = "Stroke Modeler 引导：以下参数控制笔迹的平滑/预测引擎（stroke modeler）。" +
+                            "数值越大 → 效果见各滑杆说明；改动仅在笔画之间生效，对新笔画生效。",
+                        color = Color(0xFFBDBDBD),
+                        style = MaterialTheme.typography.labelSmall,
+                        modifier = Modifier.padding(bottom = 4.dp),
+                    )
                     BRUSH_SETTINGS.forEach { spec ->
                         Text(
                             text = "${spec.label}  ${formatSetting(settingValues.getValue(spec.id), if (spec.max < 1f) 5 else 3)}",
                             color = Color.White,
                             style = MaterialTheme.typography.labelSmall,
+                        )
+                        // Bug #2：滑杆 label 下方渲染通俗效果说明（次级文本：字号更小、颜色更淡）。
+                        Text(
+                            text = spec.effect,
+                            color = Color(0xFF9E9E9E),
+                            style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
+                            modifier = Modifier.padding(bottom = 2.dp),
                         )
                         Slider(
                             value = settingValues.getValue(spec.id),
