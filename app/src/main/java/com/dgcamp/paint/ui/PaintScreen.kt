@@ -42,6 +42,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.dgcamp.paint.BuildConfig
 import com.dgcamp.paint.jni.PaintNative
+import kotlinx.coroutines.delay
 import java.nio.ByteBuffer
 
 /** D6-1 画笔参数滑杆规格：settingId/范围严格取 SDK docs/brush_settings_mapping.md，
@@ -113,6 +114,11 @@ fun PaintScreen() {
     // 脏标志：有新输入（gesture 回调置 true）才在下一帧 flush + 读回；空闲帧跳过读回，
     // 消除每帧 3.1MB 搬运（优化 3：读回移出每帧路径）。初值 true 让首帧上屏清好的画布。
     var dirty by remember { mutableStateOf(true) }
+    // ReadbackScheduler：把「事件 → 读回」节拍从 Compose vsync（withFrameNanos）解耦
+    // （bugfix-frame-loop-vsync-decouple）。输入驱动 + 最小间隔节流；version() 作为
+    // 同引用 bitmap 的显式重绘信号（frameVersion++ 强制重绘）。
+    val scheduler = remember { ReadbackScheduler() }
+    var frameVersion by remember { mutableIntStateOf(0) }
     // 显示区尺寸（像素），用于把屏幕触摸坐标映射到 1080x720 离屏画布坐标。
     // currentDisplayPx 供 pointerInput 协程内读取最新值（rememberUpdatedState 语义）。
     var displayPx by remember { mutableStateOf(IntSize.Zero) }
@@ -138,35 +144,60 @@ fun PaintScreen() {
     val bmp = remember { Bitmap.createBitmap(cw, ch, Bitmap.Config.ARGB_8888) }
     val rbBuf = remember { ByteBuffer.allocateDirect(cw * ch * 4) }
 
-    // 帧循环：仅在 dirty 时 flush（等批量 composite 完成）→ 零分配读回 → 复用 bitmap 上屏。
+    // vsync 循环：只保留 HUD 计数（fps/frameMs）。readback 已移出 vsync 回调
+    // （bugfix-frame-loop-vsync-decouple），回调内不再有重活，frameMs 反映纯 vsync 节拍
+    // （用户 Bug #1：绘制中不掉到 ~20ms）。
     LaunchedEffect(Unit) {
         var frames = 0; var last = System.nanoTime()
         while (true) {
             withFrameNanos { now ->
-                if (dirty) {
-                    // P7-2：不再显式调用阻塞 nativeFlush()——nativeReadback 内部的
-                    // dgcReadbackPixels 已经会对渲染线程做非阻塞 catch-up（P7-1 起，
-                    // P7-2 增加节流避免打散批量 composite），显式先 flush 再读回是
-                    // 重复且阻塞的（此前 Android 7fps 回归根因，见
-                    // docs/tasks/detail/PC-Android真机性能瓶颈修复.md 背景）。
-                    val rb0 = System.nanoTime()
-                    val rc = ctx.nativeReadback(rbBuf)
-                    val rb1 = System.nanoTime()
-                    readMs = (rb1 - rb0) / 1_000_000f
-                    if (rc == 0) {
-                        rbBuf.rewind()
-                        bmp.copyPixelsFromBuffer(rbBuf)
-                        bitmap = bmp           // 同一实例，避免重复分配
-                        dirty = false
-                    } else {
-                        lastError = "readback failed rc=$rc"
-                    }
-                }
                 frames++
                 if (now - last >= 500_000_000L) {
                     fps = frames * 1e9f / (now - last).toFloat()
                     frameMs = 1000f / (if (fps > 0f) fps else 1f)
                     frames = 0; last = now
+                }
+            }
+        }
+    }
+
+    // 读回 worker（bugfix：从 vsync 回调移出，输入驱动 + 节流，解耦事件处理节奏）。
+    // snapshotFlow { dirty }：gesture 置 dirty 即唤醒（主线程空闲窗口执行，非 vsync 相位）；
+    // collect 内用 deadline 等待（delay(scheduler.timeUntilReadableNs())）代替忙轮询。
+    // 失败重试：失败不清 pending，retry 回到循环头重试（保持旧「下次节拍重试」语义，
+    // 避免 snapshotFlow 因 dirty 值不变不再重发导致画布停更）。
+    LaunchedEffect(Unit) {
+        snapshotFlow { dirty }.collect { isDirty ->
+            // dirty=false 是成功读回路径自己清的：此时快照已上屏，无需再读回。
+            // 不判 isDirty 会在每次成功读回后（false 发射）再冗余读回一次，把读回速率翻倍、
+            // 每读回一次 requestFlush→快照刷新，弱 GPU 上反更掉帧。
+            if (!isDirty) return@collect
+            var retry = true
+            while (retry) {
+                // 循环头：deadline 等待（节流，非忙轮询）。timeUntilReadableMs() 已做 ns→ms
+                // ceil 换算（delay 按毫秒接收），避免 16ms 被当 16 亿 ms 的灾难等待。
+                val waitMs = scheduler.timeUntilReadableMs()
+                if (waitMs > 0) delay(waitMs)
+                // P7-2：不再显式调用阻塞 nativeFlush()——nativeReadback 内部的
+                // dgcReadbackPixels 已经会对渲染线程做非阻塞 catch-up（P7-1 起，
+                // P7-2 增加节流避免打散批量 composite），显式先 flush 再读回是
+                // 重复且阻塞的（此前 Android 7fps 回归根因，见
+                // docs/tasks/detail/PC-Android真机性能瓶颈修复.md 背景）。
+                val rb0 = System.nanoTime()
+                val rc = ctx.nativeReadback(rbBuf)
+                val rb1 = System.nanoTime()
+                readMs = (rb1 - rb0) / 1_000_000f
+                if (rc == 0) {
+                    rbBuf.rewind()
+                    bmp.copyPixelsFromBuffer(rbBuf)
+                    bitmap = bmp           // 同一实例，避免重复分配
+                    frameVersion++         // 显式重绘信号：同引用 bitmap 强制重绘
+                    scheduler.onReadbackComplete()
+                    dirty = false
+                    retry = false
+                } else {
+                    lastError = "readback failed rc=$rc"
+                    // 失败：pending 不清（onReadbackComplete 未调）→ 回到循环头重试
                 }
             }
         }
@@ -194,6 +225,7 @@ fun PaintScreen() {
                                 cw.toFloat(), ch.toFloat(), currentZoom,
                             )
                             ctx.nativeStrokeBegin(cx, cy, 0.5f)
+                            scheduler.onInput()   // 输入到达即申请读回（非 vsync 相位）
                         },
                         onDrag = { change, _ ->
                             change.consume()
@@ -205,16 +237,19 @@ fun PaintScreen() {
                                 cw.toFloat(), ch.toFloat(), currentZoom,
                             )
                             ctx.nativeStrokeTo(cx, cy, 0.5f)
+                            scheduler.onInput()   // 输入到达即申请读回（非 vsync 相位）
                         },
                         onDragEnd = {
                             dirty = true
                             strokeActive = false
                             ctx.nativeStrokeEnd()
+                            scheduler.onStrokeEnd()   // 抬笔：排空后补一次最终读回
                         },
                         onDragCancel = {
                             dirty = true
                             strokeActive = false
                             ctx.nativeStrokeEnd()
+                            scheduler.onStrokeEnd()   // 取消：同样收尾读回
                         },
                     )
                 },
@@ -222,6 +257,9 @@ fun PaintScreen() {
             val bmp = bitmap
             if (bmp != null) {
                 Canvas(modifier = Modifier.fillMaxSize()) {
+                    // 首行读取 frameVersion：订阅变化 → bitmap 同引用更换时靠版本号强制重绘
+                    // （bugfix 显式重绘信号，修复 `bitmap = bmp` 同引用不重组导致的红绘滞后）。
+                    frameVersion
                     val img = bmp.asImageBitmap()
                     val dstW = this.size.width.toInt()
                     val dstH = this.size.height.toInt()
