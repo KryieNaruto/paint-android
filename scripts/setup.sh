@@ -3,7 +3,8 @@
 # setup.sh — paint-android 消费者一键环境搭建脚本（W3，Bash / Linux-macOS / Git Bash）
 #
 # 用法:
-#   scripts/setup.sh            默认（开发）模式：探测 + 补缺指引 + 拉主仓库 + 拉 submodule + 构建 + adb 装最新 APK
+#   scripts/setup.sh            默认（开发）模式：探测 +（Windows 缺项自动装，国内镜像）+
+#                               拉主仓库 + 拉 submodule + 构建 + adb 装最新 APK
 #   scripts/setup.sh --check    只探测不安装，输出缺项清单
 #   scripts/setup.sh --test     探测 + 构建 + 跑测试门（assembleDebug 编译门 + DemoExport 审读）
 #   scripts/setup.sh --help     打印用法
@@ -11,6 +12,7 @@
 # 仓库内自包含：clone paint-android 后在此仓库内运行（SDK 为 submodule；local.properties
 # 指向 Android SDK，通常需按本机路径创建，脚本会探测并提示）。
 # 依赖: JDK≥17 / Android SDK / NDK r27+ / git。无 arm64 真机时以「编译门 + 代码审读」为测试口径。
+# Windows 上缺 JDK/SDK/NDK 时自动从国内镜像安装（JDK: TUNA；Android: 腾讯云），无需手动。
 # =============================================================================
 set -euo pipefail
 
@@ -121,6 +123,139 @@ probe_git() {
   record "git" "硬" "OK" "git $(git --version 2>/dev/null | head -n1 || true)"
 }
 
+# ---------- 国内镜像自动安装（Windows） ----------
+# 为什么不用 sdkmanager：现代 cmdline-tools 的 sdkmanager 不支持 REPO_URL / --repository_url
+# 重定向（那是上古 android 工具的机制），固定连 dl.google.com（国内基本拉不动）。故采用
+# 「镜像直接下载归档 + 按 SDK 目录结构解压 + 写 license 文件」，确定性高、无 sdkmanager 依赖。
+# 镜像源：
+#   JDK        TUNA Adoptium 镜像  https://mirrors.tuna.tsinghua.edu.cn/Adoptium/
+#   Android    Tencent 镜像        https://mirrors.cloud.tencent.com/AndroidSDK/
+#              （= Google repository2-3.xml 的国内镜像，归档 URL 相对镜像解析）
+AUTO_JDK_MIRROR='https://mirrors.tuna.tsinghua.edu.cn/Adoptium/17/jdk'
+AUTO_SDK_MIRROR='https://mirrors.cloud.tencent.com/AndroidSDK'
+
+is_windows() { case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) return 0 ;; *) return 1 ;; esac; }
+
+download_auto() { # $1=url  $2=目标文件（.part 边下边写，失败不留残件）
+  local url="$1" dest="$2" tmp="${2}.part"
+  info "下载：$url"
+  curl -fSL --retry 3 -o "$tmp" "$url" || { rm -f "$tmp"; err "下载失败（网络 / 镜像不可达）：$url"; return 1; }
+  mv -f "$tmp" "$dest"
+}
+
+unzip_to() { # $1=zip  $2=解压目录（unzip 缺失时退 tar，MSYS tar 能解 zip）
+  mkdir -p "$2"
+  if has unzip; then unzip -q -o "$1" -d "$2"
+  else tar -xf "$1" -C "$2"; fi
+}
+
+# 现有 java 是否可用（≥17）
+jdk_ok() {
+  if ! has java; then return 1; fi
+  ver_ge "$(extract_version "$(java -version 2>&1 | head -n1 || true)")" "17"
+}
+
+install_jdk_windows() {
+  local a ver home tmp="$HOME/.dgc/jdk"
+  a="x64"; case "$(uname -m)" in aarch64|arm64) a="aarch64" ;; esac
+  info "自动安装 JDK 17（Temurin，TUNA 镜像，$a）…"
+  ver="$(curl -s --max-time 30 "$AUTO_JDK_MIRROR/$a/windows/" \
+         | grep -oE "OpenJDK17U-jdk_${a}_windows_hotspot_[0-9._]+\.zip" \
+         | sort -V | tail -n1 || true)"
+  if [ -z "$ver" ]; then err "无法从 TUNA 镜像取到 JDK 版本列表（$AUTO_JDK_MIRROR/$a/windows/）"; return 1; fi
+  mkdir -p "$tmp"
+  download_auto "$AUTO_JDK_MIRROR/$a/windows/$ver" "$tmp/jdk.zip" || return 1
+  unzip_to "$tmp/jdk.zip" "$tmp" || { err "JDK 解压失败：$tmp/jdk.zip"; return 1; }
+  rm -f "$tmp/jdk.zip"
+  home="$(find "$tmp" -maxdepth 1 -type d -name 'jdk-*' 2>/dev/null | head -n1)"
+  [ -n "$home" ] || { err "JDK 解压后未找到 jdk-* 目录（$tmp）"; return 1; }
+  # JAVA_HOME 用 Windows 路径形态（与 Android Studio 一致，gradlew 在 Git Bash 下可直接用）
+  JAVA_HOME="$(has cygpath && cygpath -w "$home" || printf '%s' "$home")"
+  export JAVA_HOME
+  export PATH="$home/bin:$PATH"
+  ok "JDK 就绪：$JAVA_HOME"
+  return 0
+}
+
+# SDK 组件是否已齐（platforms;android-35 + build-tools;35.0.0 + ndk;28.2.13676358）
+sdk_components_ok() { # $1=sdk 前斜杠路径
+  [ -d "$1/platforms/android-35" ] && [ -d "$1/build-tools/35.0.0" ] && [ -d "$1/ndk/28.2.13676358" ]
+}
+
+install_sdk_windows() { # $1=sdk 前斜杠路径
+  local sdk="$1" tmp="$1/.auto" m="$AUTO_SDK_MIRROR"
+  info "自动安装 Android SDK 组件（Tencent 镜像；NDK 约 750MB，最耗时）…"
+  mkdir -p "$tmp"
+  download_auto "$m/platform-tools_r37.0.1-win.zip" "$tmp/platform-tools.zip" || return 1
+  download_auto "$m/platform-35_r02.zip"             "$tmp/platform-35.zip"    || return 1
+  download_auto "$m/build-tools_r35_windows.zip"     "$tmp/build-tools.zip"    || return 1
+  download_auto "$m/cmake-3.22.1-windows.zip"        "$tmp/cmake.zip"          || return 1
+  download_auto "$m/android-ndk-r28c-windows.zip"    "$tmp/ndk.zip"            || return 1
+
+  unzip_to "$tmp/platform-tools.zip" "$sdk" || return 1   # → $sdk/platform-tools/
+  unzip_to "$tmp/platform-35.zip" "$sdk"     || return 1  # → $sdk/android-35/
+  [ -d "$sdk/android-35" ] || { err "platform-35 解压结构异常"; return 1; }
+  mkdir -p "$sdk/platforms"; mv -f "$sdk/android-35" "$sdk/platforms/android-35"
+
+  unzip_to "$tmp/build-tools.zip" "$sdk" || return 1      # → $sdk/android-15/
+  [ -d "$sdk/android-15" ] || { err "build-tools 解压结构异常"; return 1; }
+  mkdir -p "$sdk/build-tools"; mv -f "$sdk/android-15" "$sdk/build-tools/35.0.0"
+
+  mkdir -p "$sdk/cmake/3.22.1"
+  unzip_to "$tmp/cmake.zip" "$sdk/cmake/3.22.1" || return 1  # 扁平 zip（bin/doc/share）
+
+  unzip_to "$tmp/ndk.zip" "$sdk" || return 1              # → $sdk/android-ndk-r28c/
+  [ -d "$sdk/android-ndk-r28c" ] || { err "NDK 解压结构异常"; return 1; }
+  mkdir -p "$sdk/ndk"; mv -f "$sdk/android-ndk-r28c" "$sdk/ndk/28.2.13676358"
+
+  # AGP 检查 $SDK/licenses/android-sdk-license 里的接受哈希
+  mkdir -p "$sdk/licenses"
+  printf '%s\n' '24333f8a63b6825ea9c5514f83c2829b004d1fee' > "$sdk/licenses/android-sdk-license"
+  printf '%s\n' '84831b9409646a918e30573bab4c9c91346d8abd' > "$sdk/licenses/android-sdk-preview-license"
+
+  rm -rf "$tmp"
+  ok "Android SDK 组件就绪：$sdk"
+  return 0
+}
+
+# 计算 Windows SDK 目标位置并写 local.properties（AS 转义格式）。优先沿用已有 local.properties
+# 的 sdk.dir，否则用 %LOCALAPPDATA%\Android\Sdk（再退 $HOME/Android/Sdk）。
+setup_sdk_loc_windows() {
+  local sdk_fwd sdk_win esc existing
+  existing="$(resolve_sdk_dir)"
+  if [ -n "$existing" ]; then
+    sdk_fwd="$existing"
+  elif [ -n "${LOCALAPPDATA:-}" ]; then
+    sdk_fwd="${LOCALAPPDATA//\\//}/Android/Sdk"
+  else
+    sdk_fwd="$HOME/Android/Sdk"
+  fi
+  sdk_win="$(has cygpath && cygpath -w "$sdk_fwd" || printf '%s' "$sdk_fwd")"
+  if [ ! -f "$root/local.properties" ] || ! grep -q '^sdk\.dir=' "$root/local.properties"; then
+    esc="${sdk_win//\\/\\\\}"; esc="${esc//:/\\:}"
+    printf 'sdk.dir=%s\n' "$esc" > "$root/local.properties"
+    ok "已写 $root/local.properties（sdk.dir=$sdk_win）"
+  fi
+  printf '%s' "$sdk_fwd"
+}
+
+# 装完复查 probe_all；仍缺则报明细并返回非 0
+auto_install_windows() {
+  local sdk i
+  if ! jdk_ok; then install_jdk_windows || return 1; fi
+  sdk="$(setup_sdk_loc_windows)"
+  if ! sdk_components_ok "$sdk"; then install_sdk_windows "$sdk" || return 1; fi
+  probe_all
+  if [ "$HARD_MISS" -gt 0 ]; then
+    err "自动安装后仍有 $HARD_MISS 项硬依赖缺失："
+    for i in "${!CHK_NAMES[@]}"; do
+      if [ "${CHK_STATUS[$i]}" = "MISS(硬)" ]; then printf '  - %s\n' "${CHK_DETAILS[$i]}"; fi
+    done
+    return 1
+  fi
+  return 0
+}
+
 probe_all() {
   CHK_NAMES=(); CHK_LEVELS=(); CHK_STATUS=(); CHK_DETAILS=(); HARD_MISS=0; SOFT_MISS=0
   probe_java; probe_android_sdk; probe_ndk; probe_gradle; probe_git
@@ -139,7 +274,7 @@ print_check() {
 }
 
 print_guidance() {
-  info "请手动补缺："
+  info "手动补缺指引（Windows 缺项会自动安装，仅自动安装失败或 --check 模式时按此操作）："
   info "  - JDK 17+:  https://adoptium.net/（或系统包 openjdk-17-jdk）"
   info "  - Android SDK + NDK: Android Studio → SDK Manager 装"
   info "      sdkmanager 'platforms;android-35' 'build-tools;35.0.0' 'ndk;28.2.13676358' 'cmake;3.22.1'"
@@ -154,13 +289,15 @@ print_help() {
   一键搭建 paint-android 开发/测试环境（仓库内自包含）。
 
 模式:
-  （默认） 探测 + 补缺指引 + 拉主仓库(ff-only) + 拉 SDK submodule + ./gradlew assembleDebug 构建 APK
+  （默认） 探测 +（Windows 缺项自动装，国内镜像）补缺指引 + 拉主仓库(ff-only) + 拉 SDK submodule
+           + ./gradlew assembleDebug 构建 APK
            + 有设备/模拟器时 adb install -r 覆盖安装并启动（绕开 Android Studio 自身部署缓存）
   --check  只探测不安装，输出缺项清单；硬依赖缺失时非零退出
   --test   探测 + 构建 + 测试门（assembleDebug 编译门 + DemoExport 离屏自检审读）
   --help   打印本帮助
 
 依赖: JDK≥17 / Android SDK（platforms;android-35, build-tools;35.0.0）/ NDK 28.2 / git。
+Windows 缺 JDK/SDK/NDK 时自动从国内镜像安装（JDK: TUNA；Android: 腾讯云）。
 无 arm64 真机时以「编译门 + 代码审读」为测试口径（B5-1 口径：编出带真实 Vulkan 后端的 .so）。
 EOF
 }
@@ -307,9 +444,19 @@ main() {
     exit 0
   fi
   if [ "$HARD_MISS" -gt 0 ]; then
-    print_guidance
-    err "硬依赖缺失 $HARD_MISS 项。本脚本不静默安装，请按指引补缺后重跑。"
-    exit 1
+    if is_windows; then
+      info "检测到硬依赖缺失，开始自动安装（国内镜像：TUNA / 腾讯云）…"
+      if ! auto_install_windows; then
+        print_guidance
+        err "自动安装未完成，请按上述指引手动补缺后重跑。"
+        exit 1
+      fi
+      print_check
+    else
+      print_guidance
+      err "硬依赖缺失 $HARD_MISS 项。Windows 会自动安装；Linux/macOS 请按指引手动补缺后重跑。"
+      exit 1
+    fi
   fi
 
   sync_repo "$root"
