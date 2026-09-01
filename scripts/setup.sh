@@ -31,8 +31,11 @@ extract_version() {
   elif [[ "$s" =~ ([0-9]+) ]]; then printf '%s' "${BASH_REMATCH[1]}"; fi
 }
 ver_seg() {
-  local v="$1" idx="$2" seg
-  seg="$(printf '%s' "$v" | cut -d. -f"$((idx + 1))" 2>/dev/null || true)"
+  # 用 bash 数组按 . 切段（别用 cut）：cut -d. -fN 对不含分隔符的行（如 "17"）会原样输出整行，
+  # 加 -s 又整行抑制——两种都会让版本比较出错（"17.0.x ≥ 17" 被判过旧、或单字段版本全相等）。
+  local v="$1" idx="$2" IFS=. parts seg
+  read -ra parts <<< "$v"
+  seg="${parts[$idx]:-}"
   case "$seg" in ''|*[!0-9]*) printf '0' ;; *) printf '%d' "$((10#$seg))" ;; esac
 }
 ver_ge() {
