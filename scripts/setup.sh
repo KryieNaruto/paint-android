@@ -159,24 +159,75 @@ jdk_ok() {
   ver_ge "$(extract_version "$(java -version 2>&1 | head -n1 || true)")" "17"
 }
 
+# 本脚本装过的 JDK 不在 PATH 时补挂（之前只 session export，新开 shell 找不到 java → 反复判缺重装）。
+bootstrap_managed_jdk() {
+  local home j
+  home="$(find "$HOME/.dgc/jdk" -maxdepth 1 -type d -name 'jdk-*' 2>/dev/null | head -n1 || true)"
+  [ -n "$home" ] || return 0
+  has java && return 0
+  for j in "$home/bin/java" "$home/bin/java.exe"; do
+    if [ -x "$j" ]; then
+      JAVA_HOME="$(has cygpath && cygpath -w "$home" || printf '%s' "$home")"
+      export JAVA_HOME
+      export PATH="$home/bin:$PATH"
+      return 0
+    fi
+  done
+}
+
+# 把自动装的 JDK 持久化：Git Bash 启动脚本 + Windows 用户环境变量。否则每次新开 shell 都
+# 找不到 java → 每次跑 setup 都判缺、反复全量下载重装（已实测踩坑）。幂等：已写则不重复。
+persist_jdk_windows() { # $1=home POSIX 路径  $2=JAVA_HOME Windows 形态
+  local home="$1" java_home="$2" rc bin_win
+  rc="$HOME/.bashrc"; [ -f "$HOME/.bash_profile" ] && rc="$HOME/.bash_profile"
+  if ! grep -qF "DGC_JAVA_HOME" "$rc" 2>/dev/null; then
+    {
+      printf '\n# dgc setup.sh 自动安装的 JDK（持久化，避免反复重装）\n'
+      printf 'export DGC_JAVA_HOME=%s\n' "'$home'"
+      printf 'export JAVA_HOME="$DGC_JAVA_HOME"\n'
+      printf 'export PATH="$DGC_JAVA_HOME/bin:$PATH"\n'
+    } >> "$rc"
+    info "已写入 $rc（Git Bash 启动时自动加载）"
+  fi
+  # Windows 用户环境变量（cmd / Android Studio / setx 可见）。注意别整段覆盖 %PATH%（截断风险），
+  # 用 PowerShell 在 User 级 Path 末尾追加 bin 目录。
+  bin_win="$(has cygpath && cygpath -w "$home/bin" || printf '%s' "$home/bin")"
+  if has powershell; then
+    powershell -NoProfile -Command "
+      \$bin='$bin_win';
+      \$p=[Environment]::GetEnvironmentVariable('Path','User');
+      if (\$p -notlike ('*'+\$bin+'*')) { [Environment]::SetEnvironmentVariable('Path', \$p + ';' + \$bin, 'User') };
+      [Environment]::SetEnvironmentVariable('JAVA_HOME', '$java_home', 'User');
+    " >/dev/null 2>&1 || warn "写 Windows 用户环境变量失败（不影响本次，下次会重装）"
+  elif has setx; then
+    setx JAVA_HOME "$java_home" >/dev/null 2>&1 || true
+  fi
+}
+
 install_jdk_windows() {
   local a ver home tmp="$HOME/.dgc/jdk"
-  a="x64"; case "$(uname -m)" in aarch64|arm64) a="aarch64" ;; esac
-  info "自动安装 JDK 17（Temurin，TUNA 镜像，$a）…"
-  ver="$(curl -s --max-time 30 "$AUTO_JDK_MIRROR/$a/windows/" \
-         | grep -oE "OpenJDK17U-jdk_${a}_windows_hotspot_[0-9._]+\.zip" \
-         | sort -V | tail -n1 || true)"
-  if [ -z "$ver" ]; then err "无法从 TUNA 镜像取到 JDK 版本列表（$AUTO_JDK_MIRROR/$a/windows/）"; return 1; fi
-  mkdir -p "$tmp"
-  download_auto "$AUTO_JDK_MIRROR/$a/windows/$ver" "$tmp/jdk.zip" || return 1
-  unzip_to "$tmp/jdk.zip" "$tmp" || { err "JDK 解压失败：$tmp/jdk.zip"; return 1; }
-  rm -f "$tmp/jdk.zip"
-  home="$(find "$tmp" -maxdepth 1 -type d -name 'jdk-*' 2>/dev/null | head -n1)"
-  [ -n "$home" ] || { err "JDK 解压后未找到 jdk-* 目录（$tmp）"; return 1; }
+  home="$(find "$tmp" -maxdepth 1 -type d -name 'jdk-*' 2>/dev/null | head -n1 || true)"
+  if [ -n "$home" ]; then
+    info "复用已解压 JDK：$home"
+  else
+    a="x64"; case "$(uname -m)" in aarch64|arm64) a="aarch64" ;; esac
+    info "自动安装 JDK 17（Temurin，TUNA 镜像，$a）…"
+    ver="$(curl -s --max-time 30 "$AUTO_JDK_MIRROR/$a/windows/" \
+           | grep -oE "OpenJDK17U-jdk_${a}_windows_hotspot_[0-9._]+\.zip" \
+           | sort -V | tail -n1 || true)"
+    if [ -z "$ver" ]; then err "无法从 TUNA 镜像取到 JDK 版本列表（$AUTO_JDK_MIRROR/$a/windows/）"; return 1; fi
+    mkdir -p "$tmp"
+    download_auto "$AUTO_JDK_MIRROR/$a/windows/$ver" "$tmp/jdk.zip" || return 1
+    unzip_to "$tmp/jdk.zip" "$tmp" || { err "JDK 解压失败：$tmp/jdk.zip"; return 1; }
+    rm -f "$tmp/jdk.zip"
+    home="$(find "$tmp" -maxdepth 1 -type d -name 'jdk-*' 2>/dev/null | head -n1 || true)"
+    [ -n "$home" ] || { err "JDK 解压后未找到 jdk-* 目录（$tmp）"; return 1; }
+  fi
   # JAVA_HOME 用 Windows 路径形态（与 Android Studio 一致，gradlew 在 Git Bash 下可直接用）
   JAVA_HOME="$(has cygpath && cygpath -w "$home" || printf '%s' "$home")"
   export JAVA_HOME
   export PATH="$home/bin:$PATH"
+  persist_jdk_windows "$home" "$JAVA_HOME"
   ok "JDK 就绪：$JAVA_HOME"
   return 0
 }
@@ -264,6 +315,7 @@ auto_install_windows() {
 }
 
 probe_all() {
+  bootstrap_managed_jdk   # 本脚本装过的 JDK 不在 PATH 时补挂，避免反复判缺重装
   CHK_NAMES=(); CHK_LEVELS=(); CHK_STATUS=(); CHK_DETAILS=(); HARD_MISS=0; SOFT_MISS=0
   probe_java; probe_android_sdk; probe_ndk; probe_gradle; probe_git
 }
