@@ -343,7 +343,7 @@ print_guidance() {
 
 print_help() {
   cat <<'EOF'
-用法: scripts/setup.sh [--check|--test|--help]
+用法: scripts/setup.sh [--check|--test|--no-sync|--help]
 
   一键搭建 paint-android 开发/测试环境（仓库内自包含）。
 
@@ -353,6 +353,7 @@ print_help() {
            + 有设备/模拟器时 adb install -r 覆盖安装并启动（绕开 Android Studio 自身部署缓存）
   --check  只探测不安装，输出缺项清单；硬依赖缺失时非零退出
   --test   探测 + 构建 + 测试门（assembleDebug 编译门 + DemoExport 离屏自检审读）
+  --no-sync 跳过 git 同步，直接探测+构建（工作区带未提交改动、离线、或镜像缓存滞后时用）
   --help   打印本帮助
 
 依赖: JDK≥17 / Android SDK（platforms;android-35, build-tools;35.0.0）/ NDK 28.2 / git。
@@ -480,11 +481,12 @@ install_apk() {
 # ---------- 主流程 ----------
 main() {
   local mode="dev"
-  if [ "$#" -gt 1 ]; then err "参数过多：$*（用法: setup.sh [--check|--test]）"; exit 2; fi
+  if [ "$#" -gt 1 ]; then err "参数过多：$*（用法: setup.sh [--check|--test|--no-sync]）"; exit 2; fi
   if [ "$#" -eq 1 ]; then
     case "$1" in
-      --check) mode="check" ;;
-      --test)  mode="test" ;;
+      --check)   mode="check" ;;
+      --test)    mode="test" ;;
+      --no-sync) mode="nosync" ;;
       -h|--help) print_help; exit 0 ;;
       *) err "未知参数：$1"; exit 2 ;;
     esac
@@ -518,8 +520,11 @@ main() {
     fi
   fi
 
-  sync_repo "$root"
-  sync_submodule "$root"
+  # --no-sync：跳过 git 同步（工作区可能带未提交改动，或离线/镜像缓存滞后场景），直接探测+构建
+  if [ "$mode" != "nosync" ]; then
+    sync_repo "$root"
+    sync_submodule "$root"
+  fi
   fetch_deps "$root"
   build_apk "$root"
   install_apk "$root"
