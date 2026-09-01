@@ -136,8 +136,9 @@ AUTO_SDK_MIRROR='https://mirrors.cloud.tencent.com/AndroidSDK'
 
 is_windows() { case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) return 0 ;; *) return 1 ;; esac; }
 
-download_auto() { # $1=url  $2=目标文件（.part 边下边写，失败不留残件）
+download_auto() { # $1=url  $2=目标文件（.part 边下边写；先清残留，失败不留残件）
   local url="$1" dest="$2" tmp="${2}.part"
+  rm -f "$tmp" "$dest"
   info "下载：$url"
   curl -fSL --retry 3 -o "$tmp" "$url" || { rm -f "$tmp"; err "下载失败（网络 / 镜像不可达）：$url"; return 1; }
   mv -f "$tmp" "$dest"
@@ -182,8 +183,8 @@ sdk_components_ok() { # $1=sdk 前斜杠路径
   [ -d "$1/platforms/android-35" ] && [ -d "$1/build-tools/35.0.0" ] && [ -d "$1/ndk/28.2.13676358" ]
 }
 
-install_sdk_windows() { # $1=sdk 前斜杠路径
-  local sdk="$1" tmp="$1/.auto" m="$AUTO_SDK_MIRROR"
+install_sdk_windows() { # $1=sdk POSIX 路径
+  local sdk="$1" tmp="$HOME/.dgc/.tmp" m="$AUTO_SDK_MIRROR"
   info "自动安装 Android SDK 组件（Tencent 镜像；NDK 约 750MB，最耗时）…"
   mkdir -p "$tmp"
   download_auto "$m/platform-tools_r37.0.1-win.zip" "$tmp/platform-tools.zip" || return 1
@@ -220,8 +221,10 @@ install_sdk_windows() { # $1=sdk 前斜杠路径
 
 # 计算 Windows SDK 目标位置并写 local.properties（AS 转义格式）。优先沿用已有 local.properties
 # 的 sdk.dir，否则用 %LOCALAPPDATA%\Android\Sdk（再退 $HOME/Android/Sdk）。
+# 返回 POSIX(/c/…)形态给 shell 用——经验教训：Git Bash 里 curl.exe（原生 Windows 程序）对
+# 「盘符前斜杠」路径 C:/… 的写入可能 EINVAL，而 POSIX /c/… 由 MSYS2 正确转成反斜杠再传，稳。
 setup_sdk_loc_windows() {
-  local sdk_fwd sdk_win esc existing
+  local sdk_fwd sdk_posix sdk_win esc existing
   existing="$(resolve_sdk_dir)"
   if [ -n "$existing" ]; then
     sdk_fwd="$existing"
@@ -230,13 +233,14 @@ setup_sdk_loc_windows() {
   else
     sdk_fwd="$HOME/Android/Sdk"
   fi
+  sdk_posix="$(has cygpath && cygpath -u "$sdk_fwd" || printf '%s' "$sdk_fwd")"
   sdk_win="$(has cygpath && cygpath -w "$sdk_fwd" || printf '%s' "$sdk_fwd")"
   if [ ! -f "$root/local.properties" ] || ! grep -q '^sdk\.dir=' "$root/local.properties"; then
     esc="${sdk_win//\\/\\\\}"; esc="${esc//:/\\:}"
     printf 'sdk.dir=%s\n' "$esc" > "$root/local.properties"
-    ok "已写 $root/local.properties（sdk.dir=$sdk_win）"
+    ok "已写 $root/local.properties（sdk.dir=$sdk_win）" >&2  # 本函数返回值被 $(…) 捕获，状态消息必须走 stderr，否则污染返回路径
   fi
-  printf '%s' "$sdk_fwd"
+  printf '%s' "$sdk_posix"
 }
 
 # 装完复查 probe_all；仍缺则报明细并返回非 0
