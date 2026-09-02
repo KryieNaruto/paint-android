@@ -17,6 +17,7 @@ object PaintNative {
     external fun nativeInit(w: Int, h: Int): Boolean
     external fun nativeStrokeBegin(x: Float, y: Float, pressure: Float)
     external fun nativeStrokeTo(x: Float, y: Float, pressure: Float)
+    external fun nativeStrokeToAt(x: Float, y: Float, pressure: Float, tUs: Double)  // P7-4 真实事件时间（µs）
     external fun nativeStrokeEnd()
     external fun nativeFlush()                    // drain 屏障：等 composite 完成
     external fun nativeReadback(buf: ByteBuffer): Int  // 零分配：直接写进复用 direct buffer

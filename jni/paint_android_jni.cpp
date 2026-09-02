@@ -51,6 +51,13 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_dgcamp_paint_jni_PaintNative_nativeStrokeTo(JNIEnv*, jobject, jfloat x, jfloat y, jfloat pressure) {
     if (g_sdk) dgcStrokeTo(g_sdk, x, y, pressure, 0.f, 0.f, 0);
 }
+// P7-4：真实时间戳入口——Kotlin 把 MotionEvent 时间（uptimeMillis*1000, µs）透传进来，
+// SDK 的 dgcStrokeToAt 用真实事件间隔校准 modeler 卡尔曼速度/预测长度（合成 180Hz 步长下
+// 速度被高估 ~3x → 抢跑回扯，见 docs/调研/AD平台手感延迟分析.md §3 原因 A）。
+extern "C" JNIEXPORT void JNICALL
+Java_com_dgcamp_paint_jni_PaintNative_nativeStrokeToAt(JNIEnv*, jobject, jfloat x, jfloat y, jfloat pressure, jdouble tUs) {
+    if (g_sdk) dgcStrokeToAt(g_sdk, x, y, pressure, 0.f, 0.f, 0, tUs);
+}
 extern "C" JNIEXPORT void JNICALL
 Java_com_dgcamp_paint_jni_PaintNative_nativeStrokeEnd(JNIEnv*, jobject) {
     if (g_sdk) dgcEndStroke(g_sdk);

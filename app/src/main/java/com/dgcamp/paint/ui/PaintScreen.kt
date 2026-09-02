@@ -282,7 +282,10 @@ fun PaintScreen() {
                                 currentDisplayPx.width.toFloat(), currentDisplayPx.height.toFloat(),
                                 cw.toFloat(), ch.toFloat(), currentZoom,
                             )
-                            ctx.nativeStrokeTo(cx, cy, 0.5f)
+                            // P7-4：透传 MotionEvent 真实时间（ms→µs）。PointerInputChange.uptimeMillis
+                            // 官方语义 = 当前指针事件的时间（逐事件递增，非手势起始时间）；同刻/乱序由
+                            // SDK 防御分支兜底。真实间隔校准 modeler 速度/预测长度（合成 180Hz 下 3x 高估）。
+                            ctx.nativeStrokeToAt(cx, cy, 0.5f, change.uptimeMillis * 1000.0)
                             scheduler.onInput()   // 输入到达即申请读回（非 vsync 相位）
                         },
                         onDragEnd = {
@@ -462,6 +465,28 @@ fun PaintScreen() {
                     .safeDrawingPadding()
                     .padding(bottom = 20.dp),
             ) { Text("清空画布") }
+
+            // P7-4 验证：笔迹预测 开/关（画布左下角常驻，点按即切、无需开面板）。
+            // 关 = prediction_interval_ms(12) 拨 0（modeler 平滑在、仅无预测领先）；开 = 默认 16ms。
+            // 仅笔画之间下发（与面板滑杆一致）；状态镜像进 settingValues[12] 与面板「预测间隔」读数同步。
+            // 画中禁用（strokeActive）。注：SDK modeler 惰性激活——首次点按任一下发才激活 modeler
+            // （passthrough 无预测），先点「关」再点「开」即进入干净的 A/B 两态。
+            val predictionOn = (settingValues[12] ?: 16f) > 0f
+            Button(
+                enabled = !strokeActive,
+                onClick = {
+                    val next = if (predictionOn) 0f else 16f
+                    settingValues[12] = next
+                    ctx.nativeSetBrushSetting(12, next.toDouble())
+                },
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = if (predictionOn) Color(0xFF1B5E20) else Color(0xFF616161),
+                ),
+                modifier = Modifier
+                    .align(Alignment.BottomStart)
+                    .safeDrawingPadding()
+                    .padding(start = 20.dp, bottom = 20.dp),
+            ) { Text(if (predictionOn) "预测：开（点按关闭）" else "预测：关（点按开启）") }
         }
     }
 }
