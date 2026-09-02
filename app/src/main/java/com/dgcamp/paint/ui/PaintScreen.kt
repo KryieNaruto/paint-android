@@ -42,7 +42,10 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.dgcamp.paint.BuildConfig
 import com.dgcamp.paint.jni.PaintNative
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 import java.nio.ByteBuffer
 
 /** D6-1 画笔参数滑杆规格：settingId/范围严格取 SDK docs/brush_settings_mapping.md，
@@ -88,10 +91,24 @@ private fun formatSetting(value: Float, decimals: Int = 3): String {
 }
 
 /**
+ * 双缓冲「后台缓冲」选择（P7-3）：返回「当前未显示」的那块缓冲。
+ *
+ * 语义（供 JVM 无头单测验证的纯函数，仅依赖引用相等 `===`）：
+ * - `current == null`（首帧，尚无上屏缓冲）→ 返回 `a`；
+ * - `current === a` → 返回 `b`（严格交替）；
+ * - `current === b` → 返回 `a`。
+ * 返回值恒 ≠ `current`（除非 a===b，调用方保证两块不同实例），因此主线程把返回值写进
+ * `mutableStateOf<Bitmap>` 时判等（Bitmap 未重写 equals，引用相等）恒 false → 必重组/重绘；
+ * 且后台线程写「未显示」的 back、主线程只做引用交换，front/back 永不并发触碰。
+ */
+internal fun <T : Any> backBufferFor(current: T?, a: T, b: T): T =
+    if (current === a) b else a
+
+/**
  * 绘画画布（SDK C API 接入）。
  *
  * 数据流：触摸输入 → JNI → dgcBeginStroke/StrokeTo/EndStroke → 引擎渲染 →
- *         每帧 dgcReadbackPixels 读回 RGBA8 → 复用单个 Bitmap → ImageBitmap 上屏。
+ *         每帧 dgcReadbackPixels 读回 RGBA8 → 双缓冲交替引用（bmpA/bmpB）→ ImageBitmap 上屏。
  * 浮层显示 FPS / 帧时 ms / 读回耗时 ms（spec 验收 #3）。
  *
  * D6-1/2/3：右上角「⚙ 参数」开关展开调试面板——画笔参数（12 滑杆）/ 颜色（4 滑杆+预览色块）/
@@ -100,6 +117,7 @@ private fun formatSetting(value: Float, decimals: Int = 3): String {
  *
  * 依赖：B3-1 真实内核未合并时笔迹不可见（Null 内核），本期只验收链路 + FPS 浮层。
  */
+@OptIn(ExperimentalCoroutinesApi::class)   // Dispatchers.IO.limitedParallelism(1)
 @Composable
 fun PaintScreen() {
     // 画布逻辑尺寸（1080x720 内，避免 readback 带宽过大；真机可按屏宽高）
@@ -115,10 +133,9 @@ fun PaintScreen() {
     // 消除每帧 3.1MB 搬运（优化 3：读回移出每帧路径）。初值 true 让首帧上屏清好的画布。
     var dirty by remember { mutableStateOf(true) }
     // ReadbackScheduler：把「事件 → 读回」节拍从 Compose vsync（withFrameNanos）解耦
-    // （bugfix-frame-loop-vsync-decouple）。输入驱动 + 最小间隔节流；version() 作为
-    // 同引用 bitmap 的显式重绘信号（frameVersion++ 强制重绘）。
+    // （bugfix-frame-loop-vsync-decouple）。输入驱动 + 最小间隔节流；重绘信号改由
+    // 双缓冲交替引用（bitmap 在 bmpA/bmpB 间交替写不同实例）承担，无需 frameVersion。
     val scheduler = remember { ReadbackScheduler() }
-    var frameVersion by remember { mutableIntStateOf(0) }
     // 显示区尺寸（像素），用于把屏幕触摸坐标映射到 1080x720 离屏画布坐标。
     // currentDisplayPx 供 pointerInput 协程内读取最新值（rememberUpdatedState 语义）。
     var displayPx by remember { mutableStateOf(IntSize.Zero) }
@@ -138,11 +155,17 @@ fun PaintScreen() {
     // pointerInput 协程内读取最新 zoom（rememberUpdatedState 语义，与 currentDisplayPx 一致）
     val currentZoom by rememberUpdatedState(zoom)
 
-    // 复用单个 Bitmap + 单个 direct ByteBuffer（零分配读回，优化 3）。
+    // 双缓冲（P7-3）：两块预分配 Bitmap 交替引用，零每帧分配（2×3.1MB≈6.2MB 可忽略）。
+    // 读回/copy 在后台线程写「当前未显示」的 back 缓冲，主线程只做 `bitmap = back` 引用交换，
+    // front/back 永不并发触碰，无需锁；交替新引用使 `mutableStateOf` 判等恒 false → 必重绘。
     // direct buffer 由 Java 持有，JNI 经 GetDirectBufferAddress 让 SDK 直接写入其内存，
     // 消灭每帧 std::vector/NewByteArray/SetByteArrayRegion 的分配与 3.1MB 拷贝。
-    val bmp = remember { Bitmap.createBitmap(cw, ch, Bitmap.Config.ARGB_8888) }
+    val bmpA = remember { Bitmap.createBitmap(cw, ch, Bitmap.Config.ARGB_8888) }
+    val bmpB = remember { Bitmap.createBitmap(cw, ch, Bitmap.Config.ARGB_8888) }
     val rbBuf = remember { ByteBuffer.allocateDirect(cw * ch * 4) }
+    // 单线程后台 dispatcher（P7-3）：串行化 nativeReadback+copyPixelsFromBuffer，避免并发触碰
+    // rbBuf/back 位图。limitedParallelism(1) 是 Dispatchers.IO 的视图，无需 close（不泄漏 Executor）。
+    val readbackDispatcher = remember { Dispatchers.IO.limitedParallelism(1) }
 
     // vsync 循环：只保留 HUD 计数（fps/frameMs）。readback 已移出 vsync 回调
     // （bugfix-frame-loop-vsync-decouple），回调内不再有重活，frameMs 反映纯 vsync 节拍
@@ -166,6 +189,9 @@ fun PaintScreen() {
     // collect 内用 deadline 等待（delay(scheduler.timeUntilReadableNs())）代替忙轮询。
     // 失败重试：失败不清 pending，retry 回到循环头重试（保持旧「下次节拍重试」语义，
     // 避免 snapshotFlow 因 dirty 值不变不再重发导致画布停更）。
+    // P7-3：nativeReadback + copyPixelsFromBuffer（3.1MB memcpy）包进单线程后台 dispatcher，
+    // 移出主线程关键路径（30fps 根因，见 p7-2-android-fps-measure-gotcha）；scheduler 状态
+    // 读写仍全部收敛在主线程（后台线程不触碰 scheduler），无需加锁。
     LaunchedEffect(Unit) {
         snapshotFlow { dirty }.collect { isDirty ->
             // dirty=false 是成功读回路径自己清的：此时快照已上屏，无需再读回。
@@ -178,20 +204,28 @@ fun PaintScreen() {
                 // ceil 换算（delay 按毫秒接收），避免 16ms 被当 16 亿 ms 的灾难等待。
                 val waitMs = scheduler.timeUntilReadableMs()
                 if (waitMs > 0) delay(waitMs)
+                // 后台缓冲 = 当前未显示的那块（backBufferFor：bitmap===bmpA ? bmpB : bmpA，
+                // 首帧 bitmap==null → bmpA）。与 Compose 正在绘制的 front 严格隔离。
+                val back = backBufferFor(bitmap, bmpA, bmpB)
                 // P7-2：不再显式调用阻塞 nativeFlush()——nativeReadback 内部的
                 // dgcReadbackPixels 已经会对渲染线程做非阻塞 catch-up（P7-1 起，
                 // P7-2 增加节流避免打散批量 composite），显式先 flush 再读回是
                 // 重复且阻塞的（此前 Android 7fps 回归根因，见
                 // docs/tasks/detail/PC-Android真机性能瓶颈修复.md 背景）。
-                val rb0 = System.nanoTime()
-                val rc = ctx.nativeReadback(rbBuf)
-                val rb1 = System.nanoTime()
-                readMs = (rb1 - rb0) / 1_000_000f
+                val (rc, ms) = withContext(readbackDispatcher) {
+                    val rb0 = System.nanoTime()
+                    val r = ctx.nativeReadback(rbBuf)
+                    val rb1 = System.nanoTime()
+                    val m = (rb1 - rb0) / 1_000_000f
+                    if (r == 0) {
+                        rbBuf.rewind()
+                        back.copyPixelsFromBuffer(rbBuf)   // 3.1MB memcpy 在后台线程
+                    }
+                    r to m
+                }
+                readMs = ms                                      // 回主线程再写 Compose 状态
                 if (rc == 0) {
-                    rbBuf.rewind()
-                    bmp.copyPixelsFromBuffer(rbBuf)
-                    bitmap = bmp           // 同一实例，避免重复分配
-                    frameVersion++         // 显式重绘信号：同引用 bitmap 强制重绘
+                    bitmap = back               // 交替新引用 → == 恒不等 → 必重组/重绘
                     scheduler.onReadbackComplete()
                     dirty = false
                     retry = false
@@ -254,13 +288,12 @@ fun PaintScreen() {
                     )
                 },
         ) {
-            val bmp = bitmap
-            if (bmp != null) {
+            val front = bitmap
+            if (front != null) {
                 Canvas(modifier = Modifier.fillMaxSize()) {
-                    // 首行读取 frameVersion：订阅变化 → bitmap 同引用更换时靠版本号强制重绘
-                    // （bugfix 显式重绘信号，修复 `bitmap = bmp` 同引用不重组导致的红绘滞后）。
-                    frameVersion
-                    val img = bmp.asImageBitmap()
+                    // 双缓冲交替引用：bitmap 在 bmpA/bmpB 间交替写不同实例，`==` 恒不等 →
+                    // 每次读回必触发重组/重绘（替代已删除的 frameVersion 显式重绘信号）。
+                    val img = front.asImageBitmap()
                     val dstW = this.size.width.toInt()
                     val dstH = this.size.height.toInt()
                     if (zoom > 1f) {
