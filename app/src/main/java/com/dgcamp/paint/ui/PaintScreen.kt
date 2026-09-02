@@ -155,6 +155,18 @@ fun PaintScreen() {
     // pointerInput 协程内读取最新 zoom（rememberUpdatedState 语义，与 currentDisplayPx 一致）
     val currentZoom by rememberUpdatedState(zoom)
 
+    // 清空画布（D6-2 + 常驻底栏共用单一动作源）。清空顺序为正确性关键（与 PC D6-2 一致）：
+    //   1) 若有进行中笔画先强制结束，避免半笔画残留
+    //   2) nativeFlush 排空已提交未合成的笔画（反序会 clear 后残留笔迹回写）
+    //   3) nativeClear 清成纸白（与 nativeInit 初始色一致）
+    //   4) dirty=true 让帧循环下一次读回拿到干净画布（无需额外读回）
+    val clearCanvas = {
+        if (strokeActive) { ctx.nativeStrokeEnd(); strokeActive = false }
+        ctx.nativeFlush()
+        ctx.nativeClear(0.96f, 0.95f, 0.91f, 1.0f)
+        dirty = true
+    }
+
     // 双缓冲（P7-3）：两块预分配 Bitmap 交替引用，零每帧分配（2×3.1MB≈6.2MB 可忽略）。
     // 读回/copy 在后台线程写「当前未显示」的 back 缓冲，主线程只做 `bitmap = back` 引用交换，
     // front/back 永不并发触碰，无需锁；交替新引用使 `mutableStateOf` 判等恒 false → 必重绘。
@@ -434,22 +446,22 @@ fun PaintScreen() {
                         Button(onClick = { zoom = 1f }) { Text("重置") }
                     }
                     Spacer(Modifier.height(8.dp))
-                    // 清空顺序为正确性关键（与 PC D6-2 一致）：
-                    //   1) 若有进行中笔画先强制结束，避免半笔画残留
-                    //   2) nativeFlush 排空已提交未合成的笔画（反序会 clear 后残留笔迹回写）
-                    //   3) nativeClear 清成纸白（与 nativeInit 初始色一致）
-                    //   4) dirty=true 让帧循环下一次读回拿到干净画布（无需额外读回）
                     Button(
-                        onClick = {
-                            if (strokeActive) { ctx.nativeStrokeEnd(); strokeActive = false }
-                            ctx.nativeFlush()
-                            ctx.nativeClear(0.96f, 0.95f, 0.91f, 1.0f)
-                            dirty = true
-                        },
+                        onClick = clearCanvas,
                         colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFB71C1C)),
                     ) { Text("清空画布") }
                 }
             }
+
+            // 底部居中常驻「清空画布」：面板收起也能一键清空（clearCanvas 单一动作源，面板内仍保留）。
+            Button(
+                onClick = clearCanvas,
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFB71C1C)),
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .safeDrawingPadding()
+                    .padding(bottom = 20.dp),
+            ) { Text("清空画布") }
         }
     }
 }
