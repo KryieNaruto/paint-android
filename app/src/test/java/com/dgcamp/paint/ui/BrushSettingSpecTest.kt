@@ -52,4 +52,20 @@ class BrushSettingSpecTest {
             assertTrue("id ${spec.id} effect non-blank", spec.effect.isNotBlank())
         }
     }
+
+    /**
+     * 回归（真机实测暴露）：预测开关默认态必须与 SDK modeler 激活态一致。
+     *
+     * 根因：SDK predictor 惰性激活——fresh 启动从不推送 modeler 参数（passthrough，无预测，
+     * 见 sdk_api/dgc_paint_c_api.cpp dgcSetBrushSetting「首次设置才 make_unique+setPredictor」），
+     * 但 id12 默认 16f 使「预测：开/关」开关初始显示「开」→ UI 显示开、实际无预测。
+     *
+     * 修复：id12 默认 0f（关）——fresh 启动显示「关」与 passthrough 无预测一致；用户点「开」
+     * 才推送 16f 并激活 predictor。此断言锁住「默认关 = 显示态与激活态一致」，防回归。
+     */
+    @Test
+    fun `prediction interval default is off matching lazy-activated passthrough`() {
+        val spec = BRUSH_SETTINGS.first { it.id == 12 }
+        assertEquals("id12 默认 0f（预测关，fresh 无预测）", 0f, spec.default, 0.0f)
+    }
 }

@@ -86,7 +86,7 @@ internal val BRUSH_SETTINGS = listOf(
     BrushSettingSpec(9, "弹簧阻尼常量 spring_drag_constant", 10f, 2000f, 400f, "越大抑制过冲越强、运动越粘滞"),
     BrushSettingSpec(10, "卡尔曼过程噪声 kalman_process_noise", 0.00001f, 0.01f, 0.0005f, "越大越信任最新输入，速度估计更灵敏但更抖"),
     BrushSettingSpec(11, "卡尔曼测量噪声 kalman_measurement_noise", 0.0001f, 0.1f, 0.004f, "越大越不信任单次量测，估计速度越平滑但滞后"),
-    BrushSettingSpec(12, "预测间隔 prediction_interval_ms", 0f, 100f, 16f, "越大预测点越远，越易见抢跑漂移"),
+    BrushSettingSpec(12, "预测间隔 prediction_interval_ms", 0f, 100f, 0f, "越大预测点越远，越易见抢跑漂移"),
 )
 
 /** 滑杆读数短格式：整数不带小数，小数值按 decimals 位取整后去尾零。 */
@@ -565,12 +565,14 @@ fun PaintScreen() {
             ) { Text("清空画布") }
 
             // P7-4 验证：笔迹预测 开/关（画布左下角常驻，点按即切、无需开面板）。仅 SDK 模式显示。
-            // 关 = prediction_interval_ms(12) 拨 0（modeler 平滑在、仅无预测领先）；开 = 默认 16ms。
+            // 默认关（id12 default=0，与 SDK modeler 惰性激活的 passthrough 态一致——fresh 无预测，
+            // 见 BrushSettingSpecTest 回归）；开 = prediction_interval_ms(12) 拨 16（首次点「开」
+            // 即真实下发并激活 modeler，之后具备预测领先）。
             // 仅笔画之间下发（与面板滑杆一致）；状态镜像进 settingValues[12] 与面板「预测间隔」读数同步。
             // 画中禁用（strokeActive）。注：SDK modeler 惰性激活——首次点按任一下发才激活 modeler
-            // （passthrough 无预测），先点「关」再点「开」即进入干净的 A/B 两态。
+            // （passthrough 无预测）；由「关」态起步即与 UI 默认一致，点「开」进入有预测的 A 态。
             if (renderMode == RenderMode.SDK) {
-                val predictionOn = (settingValues[12] ?: 16f) > 0f
+                val predictionOn = (settingValues[12] ?: 0f) > 0f
                 Button(
                     enabled = !strokeActive,
                     onClick = {
