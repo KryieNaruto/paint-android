@@ -566,7 +566,7 @@ fun PaintScreen() {
 
             // P7-4 验证：笔迹预测 开/关（画布左下角常驻，点按即切、无需开面板）。仅 SDK 模式显示。
             // 默认关（id12 default=0，与 SDK modeler 惰性激活的 passthrough 态一致——fresh 无预测，
-            // 见 BrushSettingSpecTest 回归）；开 = prediction_interval_ms(12) 拨 16（首次点「开」
+            // 见 BrushSettingSpecTest 回归）；开 = prediction_interval_ms(12) 拨 30（首次点「开」
             // 即真实下发并激活 modeler，之后具备预测领先）。
             // 仅笔画之间下发（与面板滑杆一致）；状态镜像进 settingValues[12] 与面板「预测间隔」读数同步。
             // 画中禁用（strokeActive）。注：SDK modeler 惰性激活——首次点按任一下发才激活 modeler
@@ -576,7 +576,7 @@ fun PaintScreen() {
                 Button(
                     enabled = !strokeActive,
                     onClick = {
-                        val next = if (predictionOn) 0f else 16f
+                        val next = if (predictionOn) 0f else 30f
                         settingValues[12] = next
                         ctx.nativeSetBrushSetting(12, next.toDouble())
                     },
