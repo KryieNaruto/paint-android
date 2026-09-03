@@ -105,6 +105,26 @@ dependencies {
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.compose.material3:material3")
 
+    // A8-1：Jetpack Ink 1.0.0（stable）低延迟渲染路径（Mode B，与 SDK Mode A 应用内开关对照）。
+    // 实测各 ink AAR AndroidManifest `uses-sdk minSdkVersion=23`（< 本项目 minSdk=26），
+    // 无需 bump minSdk，也无需 API 门控（见 docs/ink-ab-comparison.md 取舍-1 结论）。
+    // `android.graphics.Mesh` 仅 API 34 内部快路径使用，ink 在低版本自动回退 Canvas.drawPath，
+    // 由 ink-rendering 内部按 Build.VERSION 门控，非本仓库责任。
+    // ink-authoring-compose 已按 compile 范围传递引入其余模块；显式列出 Brush/StockBrushes/
+    // TextureBitmapStore（ink-brush）、Stroke（ink-strokes）、CanvasStrokeRenderer（ink-rendering）、
+    // AffineTransform（ink-geometry）以直接引用其类型，保证 Kotlin 编译期可见。
+    val inkVersion = "1.0.0"
+    implementation("androidx.ink:ink-authoring:$inkVersion")
+    implementation("androidx.ink:ink-authoring-compose:$inkVersion")
+    implementation("androidx.ink:ink-brush:$inkVersion")
+    implementation("androidx.ink:ink-brush-compose:$inkVersion")
+    implementation("androidx.ink:ink-geometry:$inkVersion")
+    implementation("androidx.ink:ink-geometry-compose:$inkVersion")
+    implementation("androidx.ink:ink-nativeloader:$inkVersion")
+    implementation("androidx.ink:ink-rendering:$inkVersion")
+    implementation("androidx.ink:ink-storage:$inkVersion")
+    implementation("androidx.ink:ink-strokes:$inkVersion")
+
     debugImplementation("androidx.compose.ui:ui-tooling")
 
     testImplementation("junit:junit:4.13.2")

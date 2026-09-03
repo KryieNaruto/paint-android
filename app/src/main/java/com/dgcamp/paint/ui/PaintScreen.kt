@@ -1,6 +1,7 @@
 package com.dgcamp.paint.ui
 
 import android.graphics.Bitmap
+import android.os.SystemClock
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -34,18 +35,22 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.ink.strokes.Stroke
 import com.dgcamp.paint.BuildConfig
 import com.dgcamp.paint.jni.PaintNative
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
+import java.io.File
 import java.nio.ByteBuffer
 
 /** D6-1 画笔参数滑杆规格：settingId/范围严格取 SDK docs/brush_settings_mapping.md，
@@ -105,6 +110,12 @@ internal fun <T : Any> backBufferFor(current: T?, a: T, b: T): T =
     if (current === a) b else a
 
 /**
+ * A8-1 渲染模式：SDK（Vulkan 离屏→readback→贴图，Mode A 基线）vs INK（Jetpack Ink 矢量 mesh
+ * 低延迟上屏，Mode B）。应用内顶部开关一次点击即切。
+ */
+internal enum class RenderMode { SDK, INK }
+
+/**
  * 绘画画布（SDK C API 接入）。
  *
  * 数据流：触摸输入 → JNI → dgcBeginStroke/StrokeTo/EndStroke → 引擎渲染 →
@@ -155,16 +166,29 @@ fun PaintScreen() {
     // pointerInput 协程内读取最新 zoom（rememberUpdatedState 语义，与 currentDisplayPx 一致）
     val currentZoom by rememberUpdatedState(zoom)
 
+    // ── A8-1 渲染模式 + ink 状态 + 量化埋点 ──
+    var renderMode by remember { mutableStateOf(RenderMode.SDK) }   // 应用内开关：SDK / INK
+    val inkFinishedStrokes = remember { mutableStateListOf<Stroke>() }  // ink 已完成笔画（供离屏 PNG 导出）
+    val frameAcc = remember { FrameTimeAccumulator() }               // 逐帧耗时 p50/p99
+    // 延迟代理用 uptimeMillis 基准（与输入事件 uptimeMillis 同源），nowMs 注入保证纯 Kotlin 可测。
+    val lagProbe = remember { LatencyProbe(nowMs = { SystemClock.uptimeMillis().toDouble() }) }
+    val context = LocalContext.current
+
     // 清空画布（D6-2 + 常驻底栏共用单一动作源）。清空顺序为正确性关键（与 PC D6-2 一致）：
     //   1) 若有进行中笔画先强制结束，避免半笔画残留
     //   2) nativeFlush 排空已提交未合成的笔画（反序会 clear 后残留笔迹回写）
     //   3) nativeClear 清成纸白（与 nativeInit 初始色一致）
     //   4) dirty=true 让帧循环下一次读回拿到干净画布（无需额外读回）
     val clearCanvas = {
-        if (strokeActive) { ctx.nativeStrokeEnd(); strokeActive = false }
-        ctx.nativeFlush()
-        ctx.nativeClear(0.96f, 0.95f, 0.91f, 1.0f)
-        dirty = true
+        if (renderMode == RenderMode.SDK) {
+            if (strokeActive) { ctx.nativeStrokeEnd(); strokeActive = false }
+            ctx.nativeFlush()
+            ctx.nativeClear(0.96f, 0.95f, 0.91f, 1.0f)
+            dirty = true
+        } else {
+            // INK：清空已完成笔画累计（进行中湿笔画由 ink 自行结束；见 docs/ink-ab-comparison.md 已知限制）。
+            inkFinishedStrokes.clear()
+        }
     }
 
     // 双缓冲（P7-3）：两块预分配 Bitmap 交替引用，零每帧分配（2×3.1MB≈6.2MB 可忽略）。
@@ -183,10 +207,18 @@ fun PaintScreen() {
     // （bugfix-frame-loop-vsync-decouple），回调内不再有重活，frameMs 反映纯 vsync 节拍
     // （用户 Bug #1：绘制中不掉到 ~20ms）。
     LaunchedEffect(Unit) {
-        var frames = 0; var last = System.nanoTime()
+        var frames = 0
+        var last = System.nanoTime()
+        var prevFrameNanos = 0L
         while (true) {
             withFrameNanos { now ->
                 frames++
+                // A8-1：逐帧耗时样本进 FrameTimeAccumulator（p50/p99 分位帧时）。
+                if (prevFrameNanos > 0L) frameAcc.record((now - prevFrameNanos) / 1_000_000f)
+                prevFrameNanos = now
+                // INK 模式无 readback，「帧就绪」= 本 vsync 帧（延迟代理的 onFramePresented 落点）；
+                // SDK 模式的「帧就绪」由 readback 成功路径记录（读回完成才真正有新帧可上屏）。
+                if (renderMode == RenderMode.INK) lagProbe.onFramePresented()
                 if (now - last >= 500_000_000L) {
                     fps = frames * 1e9f / (now - last).toFloat()
                     frameMs = 1000f / (if (fps > 0f) fps else 1f)
@@ -238,6 +270,7 @@ fun PaintScreen() {
                 readMs = ms                                      // 回主线程再写 Compose 状态
                 if (rc == 0) {
                     bitmap = back               // 交替新引用 → == 恒不等 → 必重组/重绘
+                    lagProbe.onFramePresented() // A8-1：readback 完成 ≈ 新帧就绪（输入→帧延迟代理）
                     scheduler.onReadbackComplete()
                     dirty = false
                     retry = false
@@ -259,75 +292,112 @@ fun PaintScreen() {
                 .padding(innerPadding)
                 .background(canvasColor)
                 .onSizeChanged { displayPx = it }
-                .pointerInput(Unit) {
-                    detectDragGestures(
-                        onDragStart = { offset ->
-                            strokeActive = true
-                            dirty = true
-                            // 屏幕像素 → 缩放画布坐标（zoom=1 时退化为未缩放映射）
-                            val (cx, cy) = mapScreenToCanvasZoomed(
-                                offset.x, offset.y,
-                                currentDisplayPx.width.toFloat(), currentDisplayPx.height.toFloat(),
-                                cw.toFloat(), ch.toFloat(), currentZoom,
-                            )
-                            ctx.nativeStrokeBegin(cx, cy, 0.5f)
-                            scheduler.onInput()   // 输入到达即申请读回（非 vsync 相位）
-                        },
-                        onDrag = { change, _ ->
-                            change.consume()
-                            strokeActive = true
-                            dirty = true
-                            val (cx, cy) = mapScreenToCanvasZoomed(
-                                change.position.x, change.position.y,
-                                currentDisplayPx.width.toFloat(), currentDisplayPx.height.toFloat(),
-                                cw.toFloat(), ch.toFloat(), currentZoom,
-                            )
-                            // P7-4：透传 MotionEvent 真实时间（ms→µs）。PointerInputChange.uptimeMillis
-                            // 官方语义 = 当前指针事件的时间（逐事件递增，非手势起始时间）；同刻/乱序由
-                            // SDK 防御分支兜底。真实间隔校准 modeler 速度/预测长度（合成 180Hz 下 3x 高估）。
-                            ctx.nativeStrokeToAt(cx, cy, 0.5f, change.uptimeMillis * 1000.0)
-                            scheduler.onInput()   // 输入到达即申请读回（非 vsync 相位）
-                        },
-                        onDragEnd = {
-                            dirty = true
-                            strokeActive = false
-                            ctx.nativeStrokeEnd()
-                            scheduler.onStrokeEnd()   // 抬笔：排空后补一次最终读回
-                        },
-                        onDragCancel = {
-                            dirty = true
-                            strokeActive = false
-                            ctx.nativeStrokeEnd()
-                            scheduler.onStrokeEnd()   // 取消：同样收尾读回
-                        },
-                    )
-                },
-        ) {
-            val front = bitmap
-            if (front != null) {
-                Canvas(modifier = Modifier.fillMaxSize()) {
-                    // 双缓冲交替引用：bitmap 在 bmpA/bmpB 间交替写不同实例，`==` 恒不等 →
-                    // 每次读回必触发重组/重绘（替代已删除的 frameVersion 显式重绘信号）。
-                    val img = front.asImageBitmap()
-                    val dstW = this.size.width.toInt()
-                    val dstH = this.size.height.toInt()
-                    if (zoom > 1f) {
-                        // D6-2 缩放：只采样居中视口子矩形并放大铺满显示区（等价 PC UV 子矩形）
-                        val (vx, vy, vw, vh) = computeCanvasViewport(cw.toFloat(), ch.toFloat(), zoom)
-                        drawImage(
-                            image = img,
-                            srcOffset = IntOffset(vx.toInt(), vy.toInt()),
-                            srcSize = IntSize(vw.toInt().coerceAtLeast(1), vh.toInt().coerceAtLeast(1)),
-                            dstSize = IntSize(dstW, dstH),
+                .pointerInput(renderMode) {
+                    if (renderMode == RenderMode.SDK) {
+                        detectDragGestures(
+                            onDragStart = { offset ->
+                                strokeActive = true
+                                dirty = true
+                                // 屏幕像素 → 缩放画布坐标（zoom=1 时退化为未缩放映射）
+                                val (cx, cy) = mapScreenToCanvasZoomed(
+                                    offset.x, offset.y,
+                                    currentDisplayPx.width.toFloat(), currentDisplayPx.height.toFloat(),
+                                    cw.toFloat(), ch.toFloat(), currentZoom,
+                                )
+                                ctx.nativeStrokeBegin(cx, cy, 0.5f)
+                                // onDragStart 只给 Offset（无事件时间戳），用 uptimeMillis 近似，
+                                // 与 onDrag 的 change.uptimeMillis 同基准（A8-1 延迟代理输入时刻）。
+                                lagProbe.onInput(SystemClock.uptimeMillis().toDouble())
+                                scheduler.onInput()   // 输入到达即申请读回（非 vsync 相位）
+                            },
+                            onDrag = { change, _ ->
+                                change.consume()
+                                strokeActive = true
+                                dirty = true
+                                val (cx, cy) = mapScreenToCanvasZoomed(
+                                    change.position.x, change.position.y,
+                                    currentDisplayPx.width.toFloat(), currentDisplayPx.height.toFloat(),
+                                    cw.toFloat(), ch.toFloat(), currentZoom,
+                                )
+                                // P7-4：透传 MotionEvent 真实时间（ms→µs）。PointerInputChange.uptimeMillis
+                                // 官方语义 = 当前指针事件的时间（逐事件递增，非手势起始时间）；同刻/乱序由
+                                // SDK 防御分支兜底。真实间隔校准 modeler 速度/预测长度（合成 180Hz 下 3x 高估）。
+                                ctx.nativeStrokeToAt(cx, cy, 0.5f, change.uptimeMillis * 1000.0)
+                                lagProbe.onInput(change.uptimeMillis.toDouble())
+                                scheduler.onInput()   // 输入到达即申请读回（非 vsync 相位）
+                            },
+                            onDragEnd = {
+                                dirty = true
+                                strokeActive = false
+                                ctx.nativeStrokeEnd()
+                                scheduler.onStrokeEnd()   // 抬笔：排空后补一次最终读回
+                            },
+                            onDragCancel = {
+                                dirty = true
+                                strokeActive = false
+                                ctx.nativeStrokeEnd()
+                                scheduler.onStrokeEnd()   // 取消：同样收尾读回
+                            },
                         )
                     } else {
-                        drawImage(img, dstSize = IntSize(dstW, dstH))
+                        // INK：只观测不喂 SDK（取舍-5 方案 A + FEEDBACK #1）——在 Initial pass 记录
+                        // 输入时间戳供 lagProbe（ink 也有延迟代理），但不 consume、不调 nativeStroke*，
+                        // 避免 ink 上屏与 SDK bitmap 叠加/双笔。实际绘制由子层 InProgressStrokes 的
+                        // 自建输入层处理（其只接收未消费事件，本观察者不 consume 故不干扰）。
+                        awaitPointerEventScope {
+                            while (true) {
+                                val event = awaitPointerEvent(PointerEventPass.Initial)
+                                val t = event.changes.firstOrNull()?.uptimeMillis
+                                if (t != null) lagProbe.onInput(t.toDouble())
+                            }
+                        }
                     }
+                },
+        ) {
+            when (renderMode) {
+                RenderMode.SDK -> {
+                    val front = bitmap
+                    if (front != null) {
+                        Canvas(modifier = Modifier.fillMaxSize()) {
+                            // 双缓冲交替引用：bitmap 在 bmpA/bmpB 间交替写不同实例，`==` 恒不等 →
+                            // 每次读回必触发重组/重绘（替代已删除的 frameVersion 显式重绘信号）。
+                            val img = front.asImageBitmap()
+                            val dstW = this.size.width.toInt()
+                            val dstH = this.size.height.toInt()
+                            if (zoom > 1f) {
+                                // D6-2 缩放：只采样居中视口子矩形并放大铺满显示区（等价 PC UV 子矩形）
+                                val (vx, vy, vw, vh) = computeCanvasViewport(cw.toFloat(), ch.toFloat(), zoom)
+                                drawImage(
+                                    image = img,
+                                    srcOffset = IntOffset(vx.toInt(), vy.toInt()),
+                                    srcSize = IntSize(vw.toInt().coerceAtLeast(1), vh.toInt().coerceAtLeast(1)),
+                                    dstSize = IntSize(dstW, dstH),
+                                )
+                            } else {
+                                drawImage(img, dstSize = IntSize(dstW, dstH))
+                            }
+                        }
+                    }
+                }
+                RenderMode.INK -> {
+                    InkStrokeCanvas(
+                        modifier = Modifier.fillMaxSize(),
+                        onStrokesFinished = { strokes -> inkFinishedStrokes.addAll(strokes) },
+                    )
                 }
             }
             Text(
-                text = if (!started) "SDK init failed" else
-                    "FPS: ${"%.1f".format(fps)}\nFrame: ${"%.2f".format(frameMs)} ms\nReadback: ${"%.2f".format(readMs)} ms\n$lastError",
+                text = when (renderMode) {
+                    RenderMode.SDK -> if (!started) "SDK init failed" else
+                        "SDK · FPS: ${"%.1f".format(fps)}\n" +
+                        "Frame: ${"%.2f".format(frameMs)} ms (p50 ${"%.2f".format(frameAcc.p50())} / p99 ${"%.2f".format(frameAcc.p99())})\n" +
+                        "Readback: ${"%.2f".format(readMs)} ms\n" +
+                        "输入→帧 lag: ${"%.1f".format(lagProbe.avgLagMs())} ms (n=${lagProbe.sampleCount()})\n$lastError"
+                    RenderMode.INK -> "INK · FPS: ${"%.1f".format(fps)}\n" +
+                        "Frame: ${"%.2f".format(frameMs)} ms (p50 ${"%.2f".format(frameAcc.p50())} / p99 ${"%.2f".format(frameAcc.p99())})\n" +
+                        "Readback: n/a(无readback)\n" +
+                        "输入→帧 lag: ${"%.1f".format(lagProbe.avgLagMs())} ms (n=${lagProbe.sampleCount()})"
+                },
                 color = overlayColor,
                 style = MaterialTheme.typography.bodyLarge,
                 modifier = Modifier.align(Alignment.TopStart).safeDrawingPadding().padding(12.dp),
@@ -339,7 +409,35 @@ fun PaintScreen() {
                 style = MaterialTheme.typography.labelSmall,
                 modifier = Modifier.align(Alignment.BottomEnd).safeDrawingPadding().padding(12.dp),
             )
-            // D6-1/2/3 调试面板开关（右上角）：展开/收起。
+            // A8-1 渲染模式开关（右上角，D6 参数开关上方）：一次点击在 SDK/INK 间切换，即切即生效。
+            Text(
+                text = "渲染: ${if (renderMode == RenderMode.SDK) "SDK" else "INK"}（点按切换）",
+                color = Color.White,
+                style = MaterialTheme.typography.labelMedium,
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .safeDrawingPadding()
+                    .padding(12.dp)
+                    .background(
+                        if (renderMode == RenderMode.SDK) Color(0x66000000) else Color(0x661B5E20),
+                        RoundedCornerShape(8.dp),
+                    )
+                    .clickable {
+                        val next = if (renderMode == RenderMode.SDK) RenderMode.INK else RenderMode.SDK
+                        // 切离 SDK 前收尾进行中笔画，避免残留半笔画跨模式。
+                        if (renderMode == RenderMode.SDK && strokeActive) {
+                            ctx.nativeStrokeEnd()
+                            strokeActive = false
+                        }
+                        renderMode = next
+                        lagProbe.clear()   // 模式切换重置量化样本，保证 A/B 各采独立数据
+                        frameAcc.clear()
+                        if (next == RenderMode.SDK) dirty = true   // 切回 SDK：下帧读回刷新画布
+                    }
+                    .padding(horizontal = 10.dp, vertical = 4.dp),
+            )
+
+            // D6-1/2/3 调试面板开关（右上角，渲染模式开关下方）：展开/收起。
             Text(
                 text = if (panelExpanded) "× 收起" else "⚙ 参数",
                 color = Color.White,
@@ -347,7 +445,7 @@ fun PaintScreen() {
                 modifier = Modifier
                     .align(Alignment.TopEnd)
                     .safeDrawingPadding()
-                    .padding(12.dp)
+                    .padding(top = 56.dp, end = 12.dp)
                     .background(Color(0x66000000), RoundedCornerShape(8.dp))
                     .clickable { panelExpanded = !panelExpanded }
                     .padding(horizontal = 10.dp, vertical = 4.dp),
@@ -360,7 +458,7 @@ fun PaintScreen() {
                     modifier = Modifier
                         .align(Alignment.TopEnd)
                         .safeDrawingPadding()
-                        .padding(top = 56.dp, end = 12.dp)   // 让出右上角开关按钮
+                        .padding(top = 100.dp, end = 12.dp)   // 让出右上角渲染模式开关 + 参数开关按钮
                         .widthIn(max = 420.dp)
                         .heightIn(max = 640.dp)
                         .verticalScroll(rememberScrollState())
@@ -466,27 +564,51 @@ fun PaintScreen() {
                     .padding(bottom = 20.dp),
             ) { Text("清空画布") }
 
-            // P7-4 验证：笔迹预测 开/关（画布左下角常驻，点按即切、无需开面板）。
+            // P7-4 验证：笔迹预测 开/关（画布左下角常驻，点按即切、无需开面板）。仅 SDK 模式显示。
             // 关 = prediction_interval_ms(12) 拨 0（modeler 平滑在、仅无预测领先）；开 = 默认 16ms。
             // 仅笔画之间下发（与面板滑杆一致）；状态镜像进 settingValues[12] 与面板「预测间隔」读数同步。
             // 画中禁用（strokeActive）。注：SDK modeler 惰性激活——首次点按任一下发才激活 modeler
             // （passthrough 无预测），先点「关」再点「开」即进入干净的 A/B 两态。
-            val predictionOn = (settingValues[12] ?: 16f) > 0f
-            Button(
-                enabled = !strokeActive,
-                onClick = {
-                    val next = if (predictionOn) 0f else 16f
-                    settingValues[12] = next
-                    ctx.nativeSetBrushSetting(12, next.toDouble())
-                },
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = if (predictionOn) Color(0xFF1B5E20) else Color(0xFF616161),
-                ),
-                modifier = Modifier
-                    .align(Alignment.BottomStart)
-                    .safeDrawingPadding()
-                    .padding(start = 20.dp, bottom = 20.dp),
-            ) { Text(if (predictionOn) "预测：开（点按关闭）" else "预测：关（点按开启）") }
+            if (renderMode == RenderMode.SDK) {
+                val predictionOn = (settingValues[12] ?: 16f) > 0f
+                Button(
+                    enabled = !strokeActive,
+                    onClick = {
+                        val next = if (predictionOn) 0f else 16f
+                        settingValues[12] = next
+                        ctx.nativeSetBrushSetting(12, next.toDouble())
+                    },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (predictionOn) Color(0xFF1B5E20) else Color(0xFF616161),
+                    ),
+                    modifier = Modifier
+                        .align(Alignment.BottomStart)
+                        .safeDrawingPadding()
+                        .padding(start = 20.dp, bottom = 20.dp),
+                ) { Text(if (predictionOn) "预测：开（点按关闭）" else "预测：关（点按开启）") }
+            }
+
+            // A8-1 INK 模式：离屏导出 PNG（R5 硬约束的 on-device 侧）。收集 onStrokesFinished 累积
+            // 笔画 → CanvasStrokeRenderer 离屏渲染 → compress(PNG) 落 filesDir/ink_snapshot.png。
+            if (renderMode == RenderMode.INK) {
+                Button(
+                    onClick = {
+                        val file = File(context.filesDir, "ink_snapshot.png")
+                        val ok = InkPngExporter.export(
+                            inkFinishedStrokes.toList(),
+                            displayPx.width.coerceAtLeast(1),
+                            displayPx.height.coerceAtLeast(1),
+                            file,
+                        )
+                        lastError = if (ok) "ink PNG 已导出: ${file.absolutePath}" else "ink PNG 导出失败"
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0D47A1)),
+                    modifier = Modifier
+                        .align(Alignment.BottomStart)
+                        .safeDrawingPadding()
+                        .padding(start = 20.dp, bottom = 20.dp),
+                ) { Text("导出 PNG") }
+            }
         }
     }
 }
