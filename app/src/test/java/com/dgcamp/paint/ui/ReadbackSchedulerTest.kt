@@ -89,17 +89,22 @@ class ReadbackSchedulerTest {
     }
 
     // 用例 6（plan §3.1.6）：deadline 等待恰好在间隔处可读回。
+    // A8-3：改用 DEFAULT_MIN_INTERVAL_NS 常量本身（而非硬编码 16ms）推导断言数字，测试语义
+    // 不随该常量的具体值变化（真机验证后维持 16ms 不变，见 ReadbackScheduler.kt 决策沿革注释；
+    // 硬编码防止未来该值真的调整时测试悄悄脱节而不自知）。
     @Test
     fun `deadline wait reaches readable exactly at interval`() {
         val clock = FakeClock()
-        val s = ReadbackScheduler(nowNs = clock::now)   // 默认 16ms
+        val s = ReadbackScheduler(nowNs = clock::now)   // 默认 DEFAULT_MIN_INTERVAL_NS
+        val interval = ReadbackScheduler.DEFAULT_MIN_INTERVAL_NS
+        val half = interval / 2
         clock.t = 0
         s.onInput(); s.onReadbackComplete()             // T0 读回
-        clock.t = 8 * MS
-        s.onInput()                                     // T0+8ms 输入，进入节流
-        assertEquals("距下次可读回还剩 8ms", 8 * MS, s.timeUntilReadableNs())
+        clock.t = half
+        s.onInput()                                     // T0+half 输入，进入节流
+        assertEquals("距下次可读回还剩 half", interval - half, s.timeUntilReadableNs())
         assertFalse(s.shouldReadbackNow())
-        clock.t = 16 * MS                               // T0+16ms = 恰达间隔
+        clock.t = interval                              // T0+interval = 恰达间隔
         assertTrue("到达间隔即可读回", s.shouldReadbackNow())
         assertEquals("deadline 等待归零", 0L, s.timeUntilReadableNs())
     }
