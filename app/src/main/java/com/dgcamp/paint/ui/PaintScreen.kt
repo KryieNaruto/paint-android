@@ -78,7 +78,7 @@ internal val BRUSH_SETTINGS = listOf(
     BrushSettingSpec(2, "不透明度 opacity", 0f, 1f, 1f, "越大颜色越浓、越不透明；改动在下一笔生效"),
     // 4-12：stroke modeler 参数（惰性激活，生效于新笔画）。effect 逐条取自
     // sdk/docs/brush_settings_mapping.md「改参效果（人工可辨）」列（Bug #2）。
-    BrushSettingSpec(4, "抖动消除超时 wobble_timeout_ms", 0f, 200f, 40f, "越大越平滑但越迟滞跟手"),
+    BrushSettingSpec(4, "抖动消除超时 wobble_timeout_ms", 0f, 200f, 10f, "越大越平滑但越迟滞跟手"),
     BrushSettingSpec(5, "抖动消除最低速度 wobble_speed_floor", 0f, 10f, 1.31f, "越大越容易判定为静止抖动而被压平"),
     BrushSettingSpec(6, "最小输出采样率 min_output_rate_hz", 20f, 500f, 180f, "越大补点越密、曲线越平滑，也决定预测点间距"),
     BrushSettingSpec(7, "抬笔停止距离 end_of_stroke_stopping_distance_mm", 0.01f, 5f, 0.1f, "越大末端预测点越倾向继续外推"),
@@ -94,6 +94,10 @@ private fun formatSetting(value: Float, decimals: Int = 3): String {
     if (value % 1f == 0f) return value.toInt().toString()
     return "%.${decimals}f".format(value).trimEnd('0').trimEnd('.')
 }
+
+/** 普通可变引用（非 Compose state）：供 draw phase 内做「上次绘制的是不是同一实例」比对，
+ * 写入不触发重组（用 mutableStateOf 会有副作用风险，见 drawLagProbe 用法）。 */
+private class Ref<T>(var value: T)
 
 /**
  * 双缓冲「后台缓冲」选择（P7-3）：返回「当前未显示」的那块缓冲。
@@ -155,6 +159,17 @@ fun PaintScreen() {
     val started = remember { ctx.nativeInit(cw, ch) }
     DisposableEffect(Unit) { onDispose { ctx.nativeDestroy() } }
 
+    // 启动即下发全部 modeler 参数默认（id>=4，惰性激活 modeler），确保消费端默认是权威源：
+    // 否则「预测」开关首次激活 modeler 时用的是 SDK 内置 wobble_timeout=40ms（真机跟手滞后
+    // 主因，见 bugfix-prediction-curve-overshoot 真机复测），本处默认 wobble=10 才真正生效。
+    LaunchedEffect(started) {
+        if (started) {
+            BRUSH_SETTINGS.forEach { spec ->
+                if (spec.id >= 4) ctx.nativeSetBrushSetting(spec.id, spec.default.toDouble())
+            }
+        }
+    }
+
     // ── D6-1/2/3 状态 ──
     var zoom by remember { mutableFloatStateOf(1f) }            // D6-2 缩放（[1,8]，clampZoom）
     var strokeActive by remember { mutableStateOf(false) }      // 笔画守卫：画中不改参/改色
@@ -172,6 +187,15 @@ fun PaintScreen() {
     val frameAcc = remember { FrameTimeAccumulator() }               // 逐帧耗时 p50/p99
     // 延迟代理用 uptimeMillis 基准（与输入事件 uptimeMillis 同源），nowMs 注入保证纯 Kotlin 可测。
     val lagProbe = remember { LatencyProbe(nowMs = { SystemClock.uptimeMillis().toDouble() }) }
+    // 用户反馈「HUD 显示 8-10ms 但肉眼落后 2cm」——lagProbe 只测到 dgcReadbackPixels 完成
+    // （bitmap 引用交换那一刻），漏算了 Compose 重组 + Canvas draw + 等下一个 vsync 上屏那截。
+    // drawLagProbe 在 Canvas draw lambda 里、真正执行 drawImage 那一刻打点，是更接近
+    // input-to-photon 的端到端延迟代理（仍非严格 photon，缺最后一段 GPU 合成+vsync 呈现，
+    // 但已覆盖 lagProbe 漏掉的 Compose 重组/draw 调度这一段）。
+    val drawLagProbe = remember { LatencyProbe(nowMs = { SystemClock.uptimeMillis().toDouble() }) }
+    // 上一次真正执行 draw 的 bitmap 引用（普通字段，非 Compose state——draw phase 内只做
+    // 引用比对，不应通过 mutableStateOf 触发重组，用 remember { Ref(...) } 纯持有）。
+    val lastDrawnBitmap = remember { Ref<Bitmap?>(null) }
     val context = LocalContext.current
 
     // 清空画布（D6-2 + 常驻底栏共用单一动作源）。清空顺序为正确性关键（与 PC D6-2 一致）：
@@ -308,6 +332,7 @@ fun PaintScreen() {
                                 // onDragStart 只给 Offset（无事件时间戳），用 uptimeMillis 近似，
                                 // 与 onDrag 的 change.uptimeMillis 同基准（A8-1 延迟代理输入时刻）。
                                 lagProbe.onInput(SystemClock.uptimeMillis().toDouble())
+                                drawLagProbe.onInput(SystemClock.uptimeMillis().toDouble())
                                 scheduler.onInput()   // 输入到达即申请读回（非 vsync 相位）
                             },
                             onDrag = { change, _ ->
@@ -324,6 +349,7 @@ fun PaintScreen() {
                                 // SDK 防御分支兜底。真实间隔校准 modeler 速度/预测长度（合成 180Hz 下 3x 高估）。
                                 ctx.nativeStrokeToAt(cx, cy, 0.5f, change.uptimeMillis * 1000.0)
                                 lagProbe.onInput(change.uptimeMillis.toDouble())
+                                drawLagProbe.onInput(change.uptimeMillis.toDouble())
                                 scheduler.onInput()   // 输入到达即申请读回（非 vsync 相位）
                             },
                             onDragEnd = {
@@ -361,6 +387,14 @@ fun PaintScreen() {
                         Canvas(modifier = Modifier.fillMaxSize()) {
                             // 双缓冲交替引用：bitmap 在 bmpA/bmpB 间交替写不同实例，`==` 恒不等 →
                             // 每次读回必触发重组/重绘（替代已删除的 frameVersion 显式重绘信号）。
+                            // drawLagProbe：这里是 draw phase 真正执行的地方（Compose 重组+layout
+                            // 之后才轮到 draw），比 lagProbe（readback 完成那一刻）更接近真实上屏
+                            // 时刻。只在 front 是「新」实例时打点，避免同一帧内其它重绘（如缩放滑杆
+                            // 拖动触发的重绘，bitmap 未变）重复计入。
+                            if (front !== lastDrawnBitmap.value) {
+                                lastDrawnBitmap.value = front
+                                drawLagProbe.onFramePresented()
+                            }
                             val img = front.asImageBitmap()
                             val dstW = this.size.width.toInt()
                             val dstH = this.size.height.toInt()
@@ -392,7 +426,8 @@ fun PaintScreen() {
                         "SDK · FPS: ${"%.1f".format(fps)}\n" +
                         "Frame: ${"%.2f".format(frameMs)} ms (p50 ${"%.2f".format(frameAcc.p50())} / p99 ${"%.2f".format(frameAcc.p99())})\n" +
                         "Readback: ${"%.2f".format(readMs)} ms\n" +
-                        "输入→帧 lag: ${"%.1f".format(lagProbe.avgLagMs())} ms (n=${lagProbe.sampleCount()})\n$lastError"
+                        "输入→读回 lag: ${"%.1f".format(lagProbe.avgLagMs())} ms (n=${lagProbe.sampleCount()})\n" +
+                        "输入→上屏 lag: ${"%.1f".format(drawLagProbe.avgLagMs())} ms (n=${drawLagProbe.sampleCount()})\n$lastError"
                     RenderMode.INK -> "INK · FPS: ${"%.1f".format(fps)}\n" +
                         "Frame: ${"%.2f".format(frameMs)} ms (p50 ${"%.2f".format(frameAcc.p50())} / p99 ${"%.2f".format(frameAcc.p99())})\n" +
                         "Readback: n/a(无readback)\n" +
@@ -431,6 +466,7 @@ fun PaintScreen() {
                         }
                         renderMode = next
                         lagProbe.clear()   // 模式切换重置量化样本，保证 A/B 各采独立数据
+                        drawLagProbe.clear()
                         frameAcc.clear()
                         if (next == RenderMode.SDK) dirty = true   // 切回 SDK：下帧读回刷新画布
                     }
@@ -566,7 +602,7 @@ fun PaintScreen() {
 
             // P7-4 验证：笔迹预测 开/关（画布左下角常驻，点按即切、无需开面板）。仅 SDK 模式显示。
             // 默认关（id12 default=0，与 SDK modeler 惰性激活的 passthrough 态一致——fresh 无预测，
-            // 见 BrushSettingSpecTest 回归）；开 = prediction_interval_ms(12) 拨 30（首次点「开」
+            // 见 BrushSettingSpecTest 回归）；开 = prediction_interval_ms(12) 拨 20（首次点「开」
             // 即真实下发并激活 modeler，之后具备预测领先）。
             // 仅笔画之间下发（与面板滑杆一致）；状态镜像进 settingValues[12] 与面板「预测间隔」读数同步。
             // 画中禁用（strokeActive）。注：SDK modeler 惰性激活——首次点按任一下发才激活 modeler
@@ -576,7 +612,7 @@ fun PaintScreen() {
                 Button(
                     enabled = !strokeActive,
                     onClick = {
-                        val next = if (predictionOn) 0f else 30f
+                        val next = if (predictionOn) 0f else 20f
                         settingValues[12] = next
                         ctx.nativeSetBrushSetting(12, next.toDouble())
                     },
