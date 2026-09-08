@@ -2,6 +2,8 @@ package com.dgcamp.paint.ui
 
 import android.graphics.Bitmap
 import android.os.SystemClock
+import android.view.SurfaceHolder
+import android.view.SurfaceView
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -43,6 +45,7 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.ink.strokes.Stroke
 import com.dgcamp.paint.BuildConfig
 import com.dgcamp.paint.jni.PaintNative
@@ -114,10 +117,16 @@ internal fun <T : Any> backBufferFor(current: T?, a: T, b: T): T =
     if (current === a) b else a
 
 /**
- * A8-1 渲染模式：SDK（Vulkan 离屏→readback→贴图，Mode A 基线）vs INK（Jetpack Ink 矢量 mesh
- * 低延迟上屏，Mode B）。应用内顶部开关一次点击即切。
+ * 渲染模式：SDK（Compose Canvas+drawImage，Mode A 基线）/ SDK_SURFACE_VIEW（A8-4，同一份 SDK
+ * 读回像素改用 SurfaceView lockCanvas/drawBitmap/unlockCanvasAndPost 直绘，跳过 Compose
+ * mutableStateOf 派发 + 等 Choreographer 帧回调 + recompose + layout，验证这段应用侧调度
+ * 开销是否是「输入→上屏」16ms 的主因，见 docs/plans/A8-4.md）/ INK（Jetpack Ink 矢量 mesh
+ * 低延迟上屏，Mode B）。应用内顶部开关三段循环 SDK → SDK_SURFACE_VIEW → INK → SDK。
+ *
+ * `SDK`/`SDK_SURFACE_VIEW` 统称「SDK 系」：共享全部输入处理/JNI 调用路径/清空画布/预测
+ * 开关逻辑，仅「读回像素如何显示」这一步不同。
  */
-internal enum class RenderMode { SDK, INK }
+internal enum class RenderMode { SDK, SDK_SURFACE_VIEW, INK }
 
 /**
  * 绘画画布（SDK C API 接入）。
@@ -182,7 +191,10 @@ fun PaintScreen() {
     val currentZoom by rememberUpdatedState(zoom)
 
     // ── A8-1 渲染模式 + ink 状态 + 量化埋点 ──
-    var renderMode by remember { mutableStateOf(RenderMode.SDK) }   // 应用内开关：SDK / INK
+    var renderMode by remember { mutableStateOf(RenderMode.SDK) }   // 应用内开关：SDK/SDK_SURFACE_VIEW/INK
+    // 「SDK 系」= 除 INK 外的一切——SDK 与 SDK_SURFACE_VIEW 共享输入处理/清空画布/预测开关/
+    // 调试面板可见性等一切逻辑，仅呈现方式不同（见 RenderMode 文档注释、计划 §3.1）。
+    val isSdkFamily = renderMode != RenderMode.INK
     val inkFinishedStrokes = remember { mutableStateListOf<Stroke>() }  // ink 已完成笔画（供离屏 PNG 导出）
     val frameAcc = remember { FrameTimeAccumulator() }               // 逐帧耗时 p50/p99
     // 延迟代理用 uptimeMillis 基准（与输入事件 uptimeMillis 同源），nowMs 注入保证纯 Kotlin 可测。
@@ -196,6 +208,14 @@ fun PaintScreen() {
     // 上一次真正执行 draw 的 bitmap 引用（普通字段，非 Compose state——draw phase 内只做
     // 引用比对，不应通过 mutableStateOf 触发重组，用 remember { Ref(...) } 纯持有）。
     val lastDrawnBitmap = remember { Ref<Bitmap?>(null) }
+    // A8-4：SDK_SURFACE_VIEW 路径专用状态（普通 Ref，非 Compose state——写入不应触发重组，
+    // 呈现动作已经在后台线程内直接 lockCanvas/drawBitmap/unlockCanvasAndPost 完成）。
+    // surfaceHolderRef：AndroidView factory 创建的 SurfaceView 持有的 SurfaceHolder，
+    // surfaceCreated/surfaceDestroyed 回调维护，null 表示尚未 ready/已销毁（§9 R3）。
+    val surfaceHolderRef = remember { Ref<SurfaceHolder?>(null) }
+    // lastPresentedSurfaceBitmap：SDK_SURFACE_VIEW 路径的「当前前台」记录，与 Compose 路径
+    // 的 `bitmap` state 对应但不触发重组（backBufferFor 取 current 用，见 §3.3）。
+    val lastPresentedSurfaceBitmap = remember { Ref<Bitmap?>(null) }
     val context = LocalContext.current
 
     // 清空画布（D6-2 + 常驻底栏共用单一动作源）。清空顺序为正确性关键（与 PC D6-2 一致）：
@@ -204,7 +224,7 @@ fun PaintScreen() {
     //   3) nativeClear 清成纸白（与 nativeInit 初始色一致）
     //   4) dirty=true 让帧循环下一次读回拿到干净画布（无需额外读回）
     val clearCanvas = {
-        if (renderMode == RenderMode.SDK) {
+        if (isSdkFamily) {
             if (strokeActive) { ctx.nativeStrokeEnd(); strokeActive = false }
             ctx.nativeFlush()
             ctx.nativeClear(0.96f, 0.95f, 0.91f, 1.0f)
@@ -272,9 +292,19 @@ fun PaintScreen() {
                 // ceil 换算（delay 按毫秒接收），避免 16ms 被当 16 亿 ms 的灾难等待。
                 val waitMs = scheduler.timeUntilReadableMs()
                 if (waitMs > 0) delay(waitMs)
-                // 后台缓冲 = 当前未显示的那块（backBufferFor：bitmap===bmpA ? bmpB : bmpA，
-                // 首帧 bitmap==null → bmpA）。与 Compose 正在绘制的 front 严格隔离。
-                val back = backBufferFor(bitmap, bmpA, bmpB)
+                // 后台缓冲 = 当前未显示的那块（backBufferFor：current===bmpA ? bmpB : bmpA，
+                // 首帧 current==null → bmpA）。与正在展示的 front 严格隔离。A8-4：
+                // SDK_SURFACE_VIEW 路径不写 Compose state `bitmap`（写了就会顺手触发一次
+                // Compose 重组，这恰是本任务要严格排除的自变量），改用独立的
+                // `lastPresentedSurfaceBitmap`（Ref）追踪「当前前台」——两条 SDK 系路径
+                // 共享同一对 bmpA/bmpB 物理缓冲，但 renderMode 单值互斥，同一时刻只有一条
+                // 路径在跑本 collect 块，不会出现并发写同一缓冲的问题。
+                val current: Bitmap? = if (renderMode == RenderMode.SDK_SURFACE_VIEW) {
+                    lastPresentedSurfaceBitmap.value
+                } else {
+                    bitmap
+                }
+                val back = backBufferFor(current, bmpA, bmpB)
                 // P7-2：不再显式调用阻塞 nativeFlush()——nativeReadback 内部的
                 // dgcReadbackPixels 已经会对渲染线程做非阻塞 catch-up（P7-1 起，
                 // P7-2 增加节流避免打散批量 composite），显式先 flush 再读回是
@@ -288,12 +318,30 @@ fun PaintScreen() {
                     if (r == 0) {
                         rbBuf.rewind()
                         back.copyPixelsFromBuffer(rbBuf)   // 3.1MB memcpy 在后台线程
+                        if (renderMode == RenderMode.SDK_SURFACE_VIEW) {
+                            // A8-4 核心验证点：呈现发生在同一后台线程调用序列里，紧跟在
+                            // memcpy 之后，不经 mutableStateOf/Compose 状态派发/等
+                            // Choreographer 帧回调/recompose/layout。
+                            presentBitmapToSurface(
+                                surfaceHolderRef.value, back, cw.toFloat(), ch.toFloat(), currentZoom,
+                            )
+                            // 与 Compose 分支（drawImage 真正执行那一刻）语义对等的打点位置：
+                            // 「这条路径认为的、像素真正被提交去显示的那一刻」——presentBitmapToSurface
+                            // 已经完成 unlockCanvasAndPost 调用之后（诚实的口径对等，见计划 §8.3）。
+                            drawLagProbe.onFramePresented()
+                        }
                     }
                     r to m
                 }
                 readMs = ms                                      // 回主线程再写 Compose 状态
                 if (rc == 0) {
-                    bitmap = back               // 交替新引用 → == 恒不等 → 必重组/重绘
+                    if (renderMode == RenderMode.SDK_SURFACE_VIEW) {
+                        // 非 Compose state，纯引用记录——不顺手写 `bitmap`（写了就会触发一次
+                        // 重组，这正是本任务要严格排除的自变量，见计划 §3.3）。
+                        lastPresentedSurfaceBitmap.value = back
+                    } else {
+                        bitmap = back               // 仅 Compose 路径才写状态触发 recompose/重绘
+                    }
                     lagProbe.onFramePresented() // A8-1：readback 完成 ≈ 新帧就绪（输入→帧延迟代理）
                     scheduler.onReadbackComplete()
                     dirty = false
@@ -317,7 +365,7 @@ fun PaintScreen() {
                 .background(canvasColor)
                 .onSizeChanged { displayPx = it }
                 .pointerInput(renderMode) {
-                    if (renderMode == RenderMode.SDK) {
+                    if (isSdkFamily) {
                         detectDragGestures(
                             onDragStart = { offset ->
                                 strokeActive = true
@@ -413,6 +461,32 @@ fun PaintScreen() {
                         }
                     }
                 }
+                RenderMode.SDK_SURFACE_VIEW -> {
+                    // A8-4：与 Compose Canvas 路径显示的是同一份 SDK 读回像素（同一 bmpA/bmpB
+                    // 物理缓冲），只是呈现方式换成 SurfaceView 直绘（§3.2/§3.3）——本分支自身
+                    // 不做任何绘制，绘制发生在读回 worker 后台线程的 presentBitmapToSurface
+                    // 调用里；这里只负责 Surface 生命周期接线。
+                    AndroidView(
+                        modifier = Modifier.fillMaxSize(),
+                        factory = { ctx2 ->
+                            SurfaceView(ctx2).apply {
+                                holder.addCallback(object : SurfaceHolder.Callback {
+                                    override fun surfaceCreated(h: SurfaceHolder) {
+                                        surfaceHolderRef.value = h
+                                        // §9 R3：首次 ready 时主动补一次呈现，避免「切换到该
+                                        // 模式后首帧」因 Surface 尚未创建而被跳过、要等下一次
+                                        // dirty 才补画，造成切换瞬间的额外可见延迟。
+                                        dirty = true
+                                    }
+                                    override fun surfaceChanged(h: SurfaceHolder, format: Int, w: Int, ht: Int) {}
+                                    override fun surfaceDestroyed(h: SurfaceHolder) {
+                                        surfaceHolderRef.value = null
+                                    }
+                                })
+                            }
+                        },
+                    )
+                }
                 RenderMode.INK -> {
                     InkStrokeCanvas(
                         modifier = Modifier.fillMaxSize(),
@@ -424,6 +498,13 @@ fun PaintScreen() {
                 text = when (renderMode) {
                     RenderMode.SDK -> if (!started) "SDK init failed" else
                         "SDK · FPS: ${"%.1f".format(fps)}\n" +
+                        "Frame: ${"%.2f".format(frameMs)} ms (p50 ${"%.2f".format(frameAcc.p50())} / p99 ${"%.2f".format(frameAcc.p99())})\n" +
+                        "Readback: ${"%.2f".format(readMs)} ms\n" +
+                        "输入→读回 lag: ${"%.1f".format(lagProbe.avgLagMs())} ms (n=${lagProbe.sampleCount()})\n" +
+                        "输入→上屏 lag: ${"%.1f".format(drawLagProbe.avgLagMs())} ms (n=${drawLagProbe.sampleCount()})\n$lastError"
+                    // A8-4：文案格式与 SDK 一致，供真机截图/人工记录直接读数对照三方延迟。
+                    RenderMode.SDK_SURFACE_VIEW -> if (!started) "SDK init failed" else
+                        "SurfaceView · FPS: ${"%.1f".format(fps)}\n" +
                         "Frame: ${"%.2f".format(frameMs)} ms (p50 ${"%.2f".format(frameAcc.p50())} / p99 ${"%.2f".format(frameAcc.p99())})\n" +
                         "Readback: ${"%.2f".format(readMs)} ms\n" +
                         "输入→读回 lag: ${"%.1f".format(lagProbe.avgLagMs())} ms (n=${lagProbe.sampleCount()})\n" +
@@ -444,9 +525,16 @@ fun PaintScreen() {
                 style = MaterialTheme.typography.labelSmall,
                 modifier = Modifier.align(Alignment.BottomEnd).safeDrawingPadding().padding(12.dp),
             )
-            // A8-1 渲染模式开关（右上角，D6 参数开关上方）：一次点击在 SDK/INK 间切换，即切即生效。
+            // A8-1/A8-4 渲染模式开关（右上角，D6 参数开关上方）：三段循环
+            // SDK → SDK_SURFACE_VIEW → INK → SDK，一次点击切到下一档，即切即生效。
             Text(
-                text = "渲染: ${if (renderMode == RenderMode.SDK) "SDK" else "INK"}（点按切换）",
+                text = "渲染: ${
+                    when (renderMode) {
+                        RenderMode.SDK -> "SDK"
+                        RenderMode.SDK_SURFACE_VIEW -> "SurfaceView"
+                        RenderMode.INK -> "INK"
+                    }
+                }（点按切换）",
                 color = Color.White,
                 style = MaterialTheme.typography.labelMedium,
                 modifier = Modifier
@@ -454,21 +542,30 @@ fun PaintScreen() {
                     .safeDrawingPadding()
                     .padding(12.dp)
                     .background(
-                        if (renderMode == RenderMode.SDK) Color(0x66000000) else Color(0x661B5E20),
+                        when (renderMode) {
+                            RenderMode.SDK -> Color(0x66000000)
+                            RenderMode.SDK_SURFACE_VIEW -> Color(0x661565C0)
+                            RenderMode.INK -> Color(0x661B5E20)
+                        },
                         RoundedCornerShape(8.dp),
                     )
                     .clickable {
-                        val next = if (renderMode == RenderMode.SDK) RenderMode.INK else RenderMode.SDK
-                        // 切离 SDK 前收尾进行中笔画，避免残留半笔画跨模式。
-                        if (renderMode == RenderMode.SDK && strokeActive) {
+                        val next = when (renderMode) {
+                            RenderMode.SDK -> RenderMode.SDK_SURFACE_VIEW
+                            RenderMode.SDK_SURFACE_VIEW -> RenderMode.INK
+                            RenderMode.INK -> RenderMode.SDK
+                        }
+                        // 切离 SDK 系（SDK/SDK_SURFACE_VIEW，本次即将进入 INK）前收尾进行中
+                        // 笔画，避免残留半笔画跨模式。
+                        if (isSdkFamily && strokeActive) {
                             ctx.nativeStrokeEnd()
                             strokeActive = false
                         }
                         renderMode = next
-                        lagProbe.clear()   // 模式切换重置量化样本，保证 A/B 各采独立数据
+                        lagProbe.clear()   // 模式切换重置量化样本，保证 A/B/C 各采独立数据
                         drawLagProbe.clear()
                         frameAcc.clear()
-                        if (next == RenderMode.SDK) dirty = true   // 切回 SDK：下帧读回刷新画布
+                        if (next != RenderMode.INK) dirty = true   // 切回 SDK 系：下帧读回刷新画布
                     }
                     .padding(horizontal = 10.dp, vertical = 4.dp),
             )
@@ -600,14 +697,15 @@ fun PaintScreen() {
                     .padding(bottom = 20.dp),
             ) { Text("清空画布") }
 
-            // P7-4 验证：笔迹预测 开/关（画布左下角常驻，点按即切、无需开面板）。仅 SDK 模式显示。
+            // P7-4 验证：笔迹预测 开/关（画布左下角常驻，点按即切、无需开面板）。SDK 系
+            // （SDK/SDK_SURFACE_VIEW，A8-4 起两者共享同一 SDK 引擎实例的预测开关）显示。
             // 默认关（id12 default=0，与 SDK modeler 惰性激活的 passthrough 态一致——fresh 无预测，
             // 见 BrushSettingSpecTest 回归）；开 = prediction_interval_ms(12) 拨 20（首次点「开」
             // 即真实下发并激活 modeler，之后具备预测领先）。
             // 仅笔画之间下发（与面板滑杆一致）；状态镜像进 settingValues[12] 与面板「预测间隔」读数同步。
             // 画中禁用（strokeActive）。注：SDK modeler 惰性激活——首次点按任一下发才激活 modeler
             // （passthrough 无预测）；由「关」态起步即与 UI 默认一致，点「开」进入有预测的 A 态。
-            if (renderMode == RenderMode.SDK) {
+            if (isSdkFamily) {
                 val predictionOn = (settingValues[12] ?: 0f) > 0f
                 Button(
                     enabled = !strokeActive,
