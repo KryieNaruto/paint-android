@@ -99,8 +99,15 @@ private fun formatSetting(value: Float, decimals: Int = 3): String {
 }
 
 /** 普通可变引用（非 Compose state）：供 draw phase 内做「上次绘制的是不是同一实例」比对，
- * 写入不触发重组（用 mutableStateOf 会有副作用风险，见 drawLagProbe 用法）。 */
-private class Ref<T>(var value: T)
+ * 写入不触发重组（用 mutableStateOf 会有副作用风险，见 drawLagProbe 用法）。
+ * `@Volatile`：A8-4 起 `surfaceHolderRef`（写在主线程 `SurfaceHolder.Callback` 回调里，
+ * 读在 `readbackDispatcher` 后台 IO 线程的 `presentBitmapToSurface` 调用里）是跨线程无
+ * 显式同步的读写——纯 Kotlin `var` 字段在 JMM 下不保证跨线程可见性（`withContext` 只为
+ * 同一协程的调用链建立 happens-before，不覆盖 Android 框架在另一线程发起的外部回调写入），
+ * 真机（MTK MDP1221）复现为「切到 SurfaceView 模式后画布持续黑屏，直到另一次无关的主线程
+ * 写入才把可见性带过来」——`@Volatile` 消除这个陈旧读问题（其余用途如 `lastDrawnBitmap`
+ * 本就单线程读写，`@Volatile` 对其无副作用，只是多一层保险）。 */
+private class Ref<T>(@Volatile var value: T)
 
 /**
  * 双缓冲「后台缓冲」选择（P7-3）：返回「当前未显示」的那块缓冲。
@@ -310,11 +317,12 @@ fun PaintScreen() {
                 // P7-2 增加节流避免打散批量 composite），显式先 flush 再读回是
                 // 重复且阻塞的（此前 Android 7fps 回归根因，见
                 // docs/tasks/detail/PC-Android真机性能瓶颈修复.md 背景）。
-                val (rc, ms) = withContext(readbackDispatcher) {
+                val (rc, ms, presented) = withContext(readbackDispatcher) {
                     val rb0 = System.nanoTime()
                     val r = ctx.nativeReadback(rbBuf)
                     val rb1 = System.nanoTime()
                     val m = (rb1 - rb0) / 1_000_000f
+                    var p = true   // 非 SDK_SURFACE_VIEW 路径无「呈现」这一步，恒视为已完成
                     if (r == 0) {
                         rbBuf.rewind()
                         back.copyPixelsFromBuffer(rbBuf)   // 3.1MB memcpy 在后台线程
@@ -322,19 +330,20 @@ fun PaintScreen() {
                             // A8-4 核心验证点：呈现发生在同一后台线程调用序列里，紧跟在
                             // memcpy 之后，不经 mutableStateOf/Compose 状态派发/等
                             // Choreographer 帧回调/recompose/layout。
-                            presentBitmapToSurface(
+                            p = presentBitmapToSurface(
                                 surfaceHolderRef.value, back, cw.toFloat(), ch.toFloat(), currentZoom,
                             )
                             // 与 Compose 分支（drawImage 真正执行那一刻）语义对等的打点位置：
-                            // 「这条路径认为的、像素真正被提交去显示的那一刻」——presentBitmapToSurface
-                            // 已经完成 unlockCanvasAndPost 调用之后（诚实的口径对等，见计划 §8.3）。
-                            drawLagProbe.onFramePresented()
+                            // 「这条路径认为的、像素真正被提交去显示的那一刻」——只在真正呈现
+                            // 成功（unlockCanvasAndPost 已调用）时才打点，否则会把「压根没上屏
+                            // 的一帧」记成已上屏，污染核心交付物的延迟数字（诚实口径，见计划 §8.3）。
+                            if (p) drawLagProbe.onFramePresented()
                         }
                     }
-                    r to m
+                    Triple(r, m, p)
                 }
                 readMs = ms                                      // 回主线程再写 Compose 状态
-                if (rc == 0) {
+                if (rc == 0 && presented) {
                     if (renderMode == RenderMode.SDK_SURFACE_VIEW) {
                         // 非 Compose state，纯引用记录——不顺手写 `bitmap`（写了就会触发一次
                         // 重组，这正是本任务要严格排除的自变量，见计划 §3.3）。
@@ -346,6 +355,12 @@ fun PaintScreen() {
                     scheduler.onReadbackComplete()
                     dirty = false
                     retry = false
+                } else if (rc == 0) {
+                    // §9 R3：readback 本身成功，但 SurfaceView 尚未 ready（切模式瞬间的正常
+                    // 竞态，holder 为 null 或 lockCanvas 失败）——不清 dirty，回到循环头（受
+                    // scheduler 节流约束，不会忙等）重试呈现，直到真正画到屏幕上为止；
+                    // 已消耗的 readback 仍计入节流预算，避免和真实失败路径一样反复打读回。
+                    scheduler.onReadbackComplete()
                 } else {
                     lastError = "readback failed rc=$rc"
                     // 失败：pending 不清（onReadbackComplete 未调）→ 回到循环头重试
