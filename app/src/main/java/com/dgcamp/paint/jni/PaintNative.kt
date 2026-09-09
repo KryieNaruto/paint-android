@@ -1,5 +1,6 @@
 package com.dgcamp.paint.jni
 
+import android.view.Surface
 import java.nio.ByteBuffer
 
 /**
@@ -27,6 +28,16 @@ object PaintNative {
     external fun nativeSetBrushSetting(settingId: Int, value: Double): Int
     external fun nativeSetBrushColor(r: Float, g: Float, b: Float, a: Float): Int
     external fun nativeClear(r: Float, g: Float, b: Float, a: Float): Int
+
+    // A8-5：把渲染承载切到外部 Surface（SWAPCHAIN 上屏）。Surface 非空 → JNI 经
+    // ANativeWindow_fromSurface 转 ANativeWindow* 传给 dgcSetSurface（SDK 建 VkSurfaceKHR +
+    // VkSwapchainKHR，把离屏 canvas 直接 blit→present 上去，无 readback）；Surface 为 null →
+    // dgcSetSurface(NULL) 断开、回离屏（并释放 JNI 侧持有的 ANativeWindow 引用）。
+    // w/h 传画布逻辑尺寸（离屏 canvas 保持该尺寸不变；swapchain extent 由 native window 决定）。
+    external fun nativeSetSurface(surface: Surface?, w: Int, h: Int): Boolean
+
+    /** 断开 surface：SDK 回离屏（present 回 no-op），并释放持有的 ANativeWindow（配对 ANativeWindow_fromSurface）。 */
+    fun detachSurface() = nativeSetSurface(null, 0, 0)
 
     fun init(w: Int, h: Int): Boolean = nativeInit(w, h)
 }

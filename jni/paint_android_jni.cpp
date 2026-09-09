@@ -10,15 +10,34 @@
 // SetByteArrayRegion 的 3.1MB 分配/拷贝/GC churn（app 内 readback 76-80ms → 纯 SDK ~13ms）。
 
 #include <jni.h>
+#include <android/native_window_jni.h>  // ANativeWindow_fromSurface（A8-5 SWAPCHAIN 上屏；含 native_window.h）
 #include "dgc_paint_c_api.h"
 
 namespace {
 DgcContext* g_sdk = nullptr;
 int g_w = 0, g_h = 0;
+// A8-5：JNI 侧持有的 ANativeWindow*（ANativeWindow_fromSurface 得来，须与 ANativeWindow_release
+// 配对）。SDK 只存该裸指针作「同窗复用」判定、不额外 acquire——消费端必须在把窗口交给 SDK 的
+// 期间保持该引用，直到 dgcSetSurface(NULL) 断开后才 release，避免 SDK 持 stale native window
+// / 消费端 double-free。
+ANativeWindow* g_nativeWindow = nullptr;
+
+void ReleaseNativeWindow() {
+    if (g_nativeWindow) {
+        ANativeWindow_release(g_nativeWindow);
+        g_nativeWindow = nullptr;
+    }
+}
 
 // 清理旧实例：nativeInit 重复调用 / 换 Activity 时先销毁，防泄漏与状态串扰。
+// 顺序：先销毁 SDK context（内部按 swapchain→surface→device→instance 顺序释放，不触碰窗口），
+// 再释放我们持有的 ANativeWindow 引用（dgcDestroy 已把 SDK 侧 surface 拆掉，窗口无引用方）。
 void ResetSdk() {
-    if (g_sdk) { dgcDestroy(g_sdk); g_sdk = nullptr; }
+    if (g_sdk) {
+        dgcDestroy(g_sdk);
+        g_sdk = nullptr;
+    }
+    ReleaseNativeWindow();
     g_w = g_h = 0;
 }
 }
@@ -40,6 +59,39 @@ Java_com_dgcamp_paint_jni_PaintNative_nativeInit(JNIEnv* env, jobject, jint w, j
     if (rc != 0) { ResetSdk(); return JNI_FALSE; }
     rc = dgcClear(g_sdk, 0.96f, 0.95f, 0.91f, 1.0f);
     if (rc != 0) { ResetSdk(); return JNI_FALSE; }
+    return JNI_TRUE;
+}
+
+// ── A8-5 SWAPCHAIN 上屏承载切换 ──
+// 把 Java Surface 经 ANativeWindow_fromSurface 转 ANativeWindow* 传给 dgcSetSurface：
+//   非空 surface → SDK VkBackend 建 VkSurfaceKHR+VkSwapchainKHR，把离屏 canvas 直接 present；
+//   null surface → dgcSetSurface(NULL) 断开、回离屏（present 回 no-op），并释放旧窗口引用。
+// w/h = 画布逻辑尺寸（离屏 canvas 保持该尺寸；swapchain extent 由 native window 决定，见
+// sdk_api 头注释）。调用约定：surface 生命周期配对（onSurfaceChanged/created 传、destroyed/
+// onPause 传 null），本函数重连时先断开旧窗口再连新窗，保证 SDK 永不持已释放的窗口。
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_dgcamp_paint_jni_PaintNative_nativeSetSurface(JNIEnv* env, jobject, jobject surface,
+                                                       jint w, jint h) {
+    if (!g_sdk) return JNI_FALSE;
+    if (surface == nullptr) {
+        if (g_nativeWindow) {
+            dgcSetSurface(g_sdk, nullptr, g_w, g_h);   // 断开：回离屏（present no-op）
+            ReleaseNativeWindow();                       // 断开后才释放引用
+        }
+        return JNI_TRUE;
+    }
+    ANativeWindow* win = ANativeWindow_fromSurface(env, surface);
+    if (win == nullptr) return JNI_FALSE;
+    if (g_nativeWindow) {                                // 换窗/重连：先断开旧窗口再连新窗
+        dgcSetSurface(g_sdk, nullptr, g_w, g_h);
+        ReleaseNativeWindow();
+    }
+    g_nativeWindow = win;
+    int rc = dgcSetSurface(g_sdk, win, w, h);
+    if (rc != 0) {
+        ReleaseNativeWindow();
+        return JNI_FALSE;
+    }
     return JNI_TRUE;
 }
 
