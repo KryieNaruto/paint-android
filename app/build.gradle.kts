@@ -50,6 +50,10 @@ android {
                 // brush_composite.comp 预编译为 SPIR-V 内嵌字节数组。arm64-v8a 现在
                 // 可编出带真实 Vulkan 后端（VkBackend）的 libdgc_paint.so。
                 arguments += "-DDGCPAIN_RENDER_VULKAN=ON"
+                // A8-5b 诊断（临时）：把 [PRED]/[PRED-CFG]/[PRED-SUM]/[PERF] 日志
+                // 编进 libdgc_paint.so，经 __android_log_print 送真机 logcat
+                // （真机 user 固件不转发 native stderr）。测量结束后移除本行。
+                arguments += "-DDGCPAIN_PERF=ON"
                 cppFlags += "-std=c++17"
             }
         }
