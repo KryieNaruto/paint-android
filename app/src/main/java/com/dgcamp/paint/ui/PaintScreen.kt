@@ -72,8 +72,11 @@ internal data class BrushSettingSpec(
 // settingId 0-2（radius/hardness/opacity）自 SDK bugfix 起经内核 Brush::setBase 实时生效于
 // 下一笔 stroke（映射表注，笔画之间生效），保留控件与 PC 一致；4-12 为 stroke modeler 参数
 // （惰性激活，生效于新笔画）。跳过 3（RADIUS_LOG，PC 也未接）。id 与 sdk_api/dgc_paint_c_api.h
-// 的 DgcBrushSetting 枚举一致。spring 默认值对齐 SDK 新默认（K/m=40000、C/m=400，ωn=200 rad/s
-// 临界阻尼，见 core/stroke_predictor.h bugfix Fix B 校准依据）。
+// 的 DgcBrushSetting 枚举一致。默认值是 A8-5d 真机手工扫滑杆定下的「最跟手」组合
+// （wobble=0 关平滑、K/m=100000 配 C/m=632 构成临界阻尼 ζ=1、预测间隔=0 关预测），
+// 覆盖 SDK 侧缺省（wobble=40 / K=40000 / C=400，见 core/stroke_predictor.h）；
+// SDK 缺省保持不变以免波及 determinism/golden 测试。id8 的 100000 正好落在区间上边界
+// （1000..100000），Slider 不 clamp（value==max 仍在 valueRange 内）。
 internal val BRUSH_SETTINGS = listOf(
     // 0-2：笔刷内核基础参数（bugfix 起经内核 setBase 实时生效于下一笔 stroke），effect 注明生效时机。
     BrushSettingSpec(0, "半径 radius", 1f, 100f, 20f, "越大笔触越粗；改动在下一笔生效"),
@@ -81,15 +84,15 @@ internal val BRUSH_SETTINGS = listOf(
     BrushSettingSpec(2, "不透明度 opacity", 0f, 1f, 1f, "越大颜色越浓、越不透明；改动在下一笔生效"),
     // 4-12：stroke modeler 参数（惰性激活，生效于新笔画）。effect 逐条取自
     // sdk/docs/brush_settings_mapping.md「改参效果（人工可辨）」列（Bug #2）。
-    BrushSettingSpec(4, "抖动消除超时 wobble_timeout_ms", 0f, 200f, 10f, "越大越平滑但越迟滞跟手"),
+    BrushSettingSpec(4, "抖动消除超时 wobble_timeout_ms", 0f, 200f, 0f, "越大越平滑但越迟滞跟手；默认 0（关平滑，最跟手）"),
     BrushSettingSpec(5, "抖动消除最低速度 wobble_speed_floor", 0f, 10f, 1.31f, "越大越容易判定为静止抖动而被压平"),
     BrushSettingSpec(6, "最小输出采样率 min_output_rate_hz", 20f, 500f, 180f, "越大补点越密、曲线越平滑，也决定预测点间距"),
     BrushSettingSpec(7, "抬笔停止距离 end_of_stroke_stopping_distance_mm", 0.01f, 5f, 0.1f, "越大末端预测点越倾向继续外推"),
-    BrushSettingSpec(8, "弹簧质量常量 spring_mass_constant", 1000f, 100000f, 40000f, "越大响应越快、越跟手"),
-    BrushSettingSpec(9, "弹簧阻尼常量 spring_drag_constant", 10f, 2000f, 400f, "越大抑制过冲越强、运动越粘滞"),
+    BrushSettingSpec(8, "弹簧质量常量 spring_mass_constant", 1000f, 100000f, 100000f, "越大响应越快、越跟手；默认 100000（最快，与 C=632 构成临界阻尼 ζ=1）"),
+    BrushSettingSpec(9, "弹簧阻尼常量 spring_drag_constant", 10f, 2000f, 632f, "越大抑制过冲越强、运动越粘滞；默认 632（K=100000 的临界阻尼，刚好不过冲）"),
     BrushSettingSpec(10, "卡尔曼过程噪声 kalman_process_noise", 0.00001f, 0.01f, 0.0005f, "越大越信任最新输入，速度估计更灵敏但更抖"),
     BrushSettingSpec(11, "卡尔曼测量噪声 kalman_measurement_noise", 0.0001f, 0.1f, 0.004f, "越大越不信任单次量测，估计速度越平滑但滞后"),
-    BrushSettingSpec(12, "预测间隔 prediction_interval_ms", 0f, 100f, 0f, "越大预测点越远，越易见抢跑漂移"),
+    BrushSettingSpec(12, "预测间隔 prediction_interval_ms", 0f, 100f, 0f, "越大预测点越远，越易见抢跑漂移；默认 0（预测关，实测最跟手）"),
 )
 
 /** 滑杆读数短格式：整数不带小数，小数值按 decimals 位取整后去尾零。 */
@@ -124,16 +127,47 @@ internal fun <T : Any> backBufferFor(current: T?, a: T, b: T): T =
     if (current === a) b else a
 
 /**
- * 渲染模式：SDK（Compose Canvas+drawImage，Mode A 基线）/ SDK_SURFACE_VIEW（A8-4，同一份 SDK
- * 读回像素改用 SurfaceView lockCanvas/drawBitmap/unlockCanvasAndPost 直绘，跳过 Compose
- * mutableStateOf 派发 + 等 Choreographer 帧回调 + recompose + layout，验证这段应用侧调度
- * 开销是否是「输入→上屏」16ms 的主因，见 docs/plans/A8-4.md）/ INK（Jetpack Ink 矢量 mesh
- * 低延迟上屏，Mode B）。应用内顶部开关三段循环 SDK → SDK_SURFACE_VIEW → INK → SDK。
+ * 渲染模式：
+ * - SDK —— Compose Canvas+drawImage（Mode A 基线）；
+ * - SWAPCHAIN —— A8-5：把离屏 canvas 交给 SDK 直接 blit→swapchain present 到 SurfaceView，
+ *   无 readback（消灭 ~10ms 级 readback 延迟地板，逼近 Ink；见 sdk 侧 A8-5 plan/spec）；
+ * - SDK_SURFACE_VIEW —— A8-4：同一份 SDK 读回像素改用 SurfaceView lockCanvas/drawBitmap/
+ *   unlockCanvasAndPost 直绘，跳过 Compose mutableStateOf 派发 + 等 Choreographer 帧回调 +
+ *   recompose + layout，验证这段应用侧调度开销是否是「输入→上屏」16ms 的主因（真机结论：
+ *   无改善，A8-4 结论定稿；代码保留作参考，见 docs/plans/A8-4.md）；
+ * - INK —— Jetpack Ink 矢量 mesh 低延迟上屏（Mode B）。
  *
- * `SDK`/`SDK_SURFACE_VIEW` 统称「SDK 系」：共享全部输入处理/JNI 调用路径/清空画布/预测
- * 开关逻辑，仅「读回像素如何显示」这一步不同。
+ * 应用内顶部开关四段循环 SDK → SWAPCHAIN → SDK_SURFACE_VIEW → INK → SDK
+ * （SWAPCHAIN 紧邻默认态 SDK，A8-5 主对照一次点击即达；循环顺序见 [nextRenderMode]）。
+ *
+ * `SDK`/`SWAPCHAIN`/`SDK_SURFACE_VIEW` 统称「SDK 系」：共享全部输入处理/JNI 调用路径/清空
+ * 画布/预测开关/导出逻辑，仅「离屏像素如何显示」这一步不同——SDK 与 SDK_SURFACE_VIEW 走
+ * readback→Bitmap→上屏（读回后以 Compose drawImage 或 SurfaceView lockCanvas 呈现），
+ * SWAPCHAIN 走 SDK present（无 readback，消费端不启动 ReadbackScheduler/读回循环，画布由
+ * SDK 直接画到 SurfaceView）。
  */
-internal enum class RenderMode { SDK, SDK_SURFACE_VIEW, INK }
+internal enum class RenderMode { SDK, SWAPCHAIN, SDK_SURFACE_VIEW, INK }
+
+/** 顶部渲染模式开关的循环顺序（SWAPCHAIN 紧邻默认态 SDK，便于 SDK↔SWAPCHAIN 快速对照）。 */
+internal fun nextRenderMode(current: RenderMode): RenderMode = when (current) {
+    RenderMode.SDK -> RenderMode.SWAPCHAIN
+    RenderMode.SWAPCHAIN -> RenderMode.SDK_SURFACE_VIEW
+    RenderMode.SDK_SURFACE_VIEW -> RenderMode.INK
+    RenderMode.INK -> RenderMode.SDK
+}
+
+/** 该模式是否走「readback→Bitmap」上屏（决定读回 worker 是否启动）。SWAPCHAIN/INK 无 readback。 */
+internal val RenderMode.readsBack: Boolean
+    get() = this == RenderMode.SDK || this == RenderMode.SDK_SURFACE_VIEW
+
+/** 模式短名（顶部开关/浮层文案）。 */
+internal val RenderMode.hudLabel: String
+    get() = when (this) {
+        RenderMode.SDK -> "SDK"
+        RenderMode.SWAPCHAIN -> "Swapchain"
+        RenderMode.SDK_SURFACE_VIEW -> "SurfaceView"
+        RenderMode.INK -> "INK"
+    }
 
 /**
  * 绘画画布（SDK C API 接入）。
@@ -198,10 +232,15 @@ fun PaintScreen() {
     val currentZoom by rememberUpdatedState(zoom)
 
     // ── A8-1 渲染模式 + ink 状态 + 量化埋点 ──
-    var renderMode by remember { mutableStateOf(RenderMode.SDK) }   // 应用内开关：SDK/SDK_SURFACE_VIEW/INK
-    // 「SDK 系」= 除 INK 外的一切——SDK 与 SDK_SURFACE_VIEW 共享输入处理/清空画布/预测开关/
-    // 调试面板可见性等一切逻辑，仅呈现方式不同（见 RenderMode 文档注释、计划 §3.1）。
+    var renderMode by remember { mutableStateOf(RenderMode.SDK) }   // 应用内开关：SDK/SWAPCHAIN/SDK_SURFACE_VIEW/INK
+    // 「SDK 系」= 除 INK 外的一切——SDK/SWAPCHAIN/SDK_SURFACE_VIEW 共享输入处理/清空画布/预测
+    // 开关/调试面板可见性等一切逻辑，仅呈现方式不同（SWAPCHAIN=SDK present 直接上屏，SDK/
+    // SDK_SURFACE_VIEW=readback→Bitmap→上屏，见 RenderMode 文档注释）。isSdkFamily 决定手势
+    // 分支走 detectDragGestures → nativeStroke*（SWAPCHAIN 与其它 SDK 系一致喂 C API）。
     val isSdkFamily = renderMode != RenderMode.INK
+    // 该模式是否走「readback→Bitmap」上屏：SDK/SDK_SURFACE_VIEW 启动读回 worker；
+    // SWAPCHAIN 无 readback（由 SDK present），INK 无 readback——两者不启动读回循环。
+    val readsBackMode = renderMode.readsBack
     val inkFinishedStrokes = remember { mutableStateListOf<Stroke>() }  // ink 已完成笔画（供离屏 PNG 导出）
     val frameAcc = remember { FrameTimeAccumulator() }               // 逐帧耗时 p50/p99
     // 延迟代理用 uptimeMillis 基准（与输入事件 uptimeMillis 同源），nowMs 注入保证纯 Kotlin 可测。
@@ -224,6 +263,15 @@ fun PaintScreen() {
     // 的 `bitmap` state 对应但不触发重组（backBufferFor 取 current 用，见 §3.3）。
     val lastPresentedSurfaceBitmap = remember { Ref<Bitmap?>(null) }
     val context = LocalContext.current
+
+    // A8-5 SWAPCHAIN：断开 surface 的统一动作——nativeSetSurface(null) 让 SDK 回离屏
+    // （present 回 no-op）并释放 JNI 侧 ANativeWindow 引用。SDK 的 dgcSetSurface(NULL) 会
+    // 走 initOffscreen 重建离屏画布（图像内容未定义，见 SDK vk_backend CreateCanvas 注释），
+    // 故断开后补一次清纸白，避免切回 SDK/SurfaceView readback 模式读到 garbage。
+    val disconnectSwapchain = {
+        ctx.nativeSetSurface(null, 0, 0)
+        ctx.nativeClear(0.96f, 0.95f, 0.91f, 1f)
+    }
 
     // 清空画布（D6-2 + 常驻底栏共用单一动作源）。清空顺序为正确性关键（与 PC D6-2 一致）：
     //   1) 若有进行中笔画先强制结束，避免半笔画残留
@@ -267,9 +315,17 @@ fun PaintScreen() {
                 // A8-1：逐帧耗时样本进 FrameTimeAccumulator（p50/p99 分位帧时）。
                 if (prevFrameNanos > 0L) frameAcc.record((now - prevFrameNanos) / 1_000_000f)
                 prevFrameNanos = now
-                // INK 模式无 readback，「帧就绪」= 本 vsync 帧（延迟代理的 onFramePresented 落点）；
-                // SDK 模式的「帧就绪」由 readback 成功路径记录（读回完成才真正有新帧可上屏）。
-                if (renderMode == RenderMode.INK) lagProbe.onFramePresented()
+                // INK/SWAPCHAIN 无 readback，「帧就绪」按各自语义在 vsync 打点：
+                // INK = 本 vsync 帧（既有输入→帧延迟代理落点）；SWAPCHAIN = present 完成——
+                // 消费端无 SDK present 完成回调，取「输入后的下一次 vsync」作代理（SDK 的
+                // composite→present 在 vsync 节奏内异步完成，口径与离屏 drawLagProbe「真正把
+                // 像素提交去显示那一刻」对等可比，见 A8-5 plan §4 / spec §6）。
+                // SDK/SDK_SURFACE_VIEW 的「帧就绪」由 readback 成功路径记录（读回完成才有新帧）。
+                when (renderMode) {
+                    RenderMode.INK -> lagProbe.onFramePresented()
+                    RenderMode.SWAPCHAIN -> drawLagProbe.onFramePresented()
+                    RenderMode.SDK, RenderMode.SDK_SURFACE_VIEW -> {}
+                }
                 if (now - last >= 500_000_000L) {
                     fps = frames * 1e9f / (now - last).toFloat()
                     frameMs = 1000f / (if (fps > 0f) fps else 1f)
@@ -287,7 +343,11 @@ fun PaintScreen() {
     // P7-3：nativeReadback + copyPixelsFromBuffer（3.1MB memcpy）包进单线程后台 dispatcher，
     // 移出主线程关键路径（30fps 根因，见 p7-2-android-fps-measure-gotcha）；scheduler 状态
     // 读写仍全部收敛在主线程（后台线程不触碰 scheduler），无需加锁。
-    LaunchedEffect(Unit) {
+    // A8-5：effect 以 readsBackMode（仅 SDK/SDK_SURFACE_VIEW 为 true）为 key——SWAPCHAIN/INK
+    // 不启动本循环（SWAPCHAIN 显示由 SDK present 承担，无 readback；INK 走 ink 自身上屏）。
+    // 切回 readback 模式时 effect 重启、snapshotFlow 立即发射当前 dirty → 补一次读回刷新。
+    LaunchedEffect(readsBackMode) {
+        if (!readsBackMode) return@LaunchedEffect   // SWAPCHAIN/INK：无 readback，不启动读回循环
         snapshotFlow { dirty }.collect { isDirty ->
             // dirty=false 是成功读回路径自己清的：此时快照已上屏，无需再读回。
             // 不判 isDirty 会在每次成功读回后（false 发射）再冗余读回一次，把读回速率翻倍、
@@ -385,11 +445,14 @@ fun PaintScreen() {
                             onDragStart = { offset ->
                                 strokeActive = true
                                 dirty = true
+                                // SWAPCHAIN：SDK present 源恒为整张 canvasImage（blit 全图），无 readback
+                                // 路径的「居中视口子采样」概念——输入按 zoom=1 映射才与上屏一致。
+                                val effZoom = if (renderMode == RenderMode.SWAPCHAIN) 1f else currentZoom
                                 // 屏幕像素 → 缩放画布坐标（zoom=1 时退化为未缩放映射）
                                 val (cx, cy) = mapScreenToCanvasZoomed(
                                     offset.x, offset.y,
                                     currentDisplayPx.width.toFloat(), currentDisplayPx.height.toFloat(),
-                                    cw.toFloat(), ch.toFloat(), currentZoom,
+                                    cw.toFloat(), ch.toFloat(), effZoom,
                                 )
                                 ctx.nativeStrokeBegin(cx, cy, 0.5f)
                                 // onDragStart 只给 Offset（无事件时间戳），用 uptimeMillis 近似，
@@ -402,10 +465,11 @@ fun PaintScreen() {
                                 change.consume()
                                 strokeActive = true
                                 dirty = true
+                                val effZoom = if (renderMode == RenderMode.SWAPCHAIN) 1f else currentZoom
                                 val (cx, cy) = mapScreenToCanvasZoomed(
                                     change.position.x, change.position.y,
                                     currentDisplayPx.width.toFloat(), currentDisplayPx.height.toFloat(),
-                                    cw.toFloat(), ch.toFloat(), currentZoom,
+                                    cw.toFloat(), ch.toFloat(), effZoom,
                                 )
                                 // P7-4：透传 MotionEvent 真实时间（ms→µs）。PointerInputChange.uptimeMillis
                                 // 官方语义 = 当前指针事件的时间（逐事件递增，非手势起始时间）；同刻/乱序由
@@ -502,6 +566,40 @@ fun PaintScreen() {
                         },
                     )
                 }
+                RenderMode.SWAPCHAIN -> {
+                    // A8-5：画布承载在 SurfaceView 上，由 SDK 把离屏 canvas 直接 present 到其
+                    // Surface（无 readback、无 Compose drawImage/lockCanvas 参与显示）。本分支自身
+                    // 不做绘制；只负责 native window 生命周期接线：
+                    //   - surfaceChanged（surfaceCreated 后必有，携带真实尺寸）→ 把 holder.surface
+                    //     经 ANativeWindow_fromSurface 交给 dgcSetSurface（attach），SDK 建
+                    //     surface+swapchain；
+                    //   - surfaceDestroyed / onPause / 切走模式 → disconnectSwapchain() 断开
+                    //     （dgcSetSurface(NULL) 回离屏 + 释放 ANativeWindow，避免 SDK 持 stale
+                    //     native window）。
+                    // 注意：SDK present 是「每轮 composite 后」触发（输入驱动），故 attach 后首帧
+                    // 及清空画布后的刷新由下一次输入驱动呈现（无 readback 路径天然如此，真机确认）。
+                    AndroidView(
+                        modifier = Modifier.fillMaxSize(),
+                        factory = { c ->
+                            SurfaceView(c).apply {
+                                holder.addCallback(object : SurfaceHolder.Callback {
+                                    override fun surfaceCreated(h: SurfaceHolder) {}
+                                    override fun surfaceChanged(h: SurfaceHolder, format: Int, w: Int, ht: Int) {
+                                        // 传画布逻辑尺寸 cw×ch（SDK 保持离屏 canvas 不变；
+                                        // swapchain extent 由 ANativeWindow 自身尺寸决定）。
+                                        if (!ctx.nativeSetSurface(h.surface, cw, ch)) {
+                                            lastError = "swapchain surface attach failed"
+                                        }
+                                    }
+                                    override fun surfaceDestroyed(h: SurfaceHolder) {
+                                        // 断开：回离屏 + 释放 native window（幂等，切模式/onPause 均走此）。
+                                        disconnectSwapchain()
+                                    }
+                                })
+                            }
+                        },
+                    )
+                }
                 RenderMode.INK -> {
                     InkStrokeCanvas(
                         modifier = Modifier.fillMaxSize(),
@@ -524,6 +622,14 @@ fun PaintScreen() {
                         "Readback: ${"%.2f".format(readMs)} ms\n" +
                         "输入→读回 lag: ${"%.1f".format(lagProbe.avgLagMs())} ms (n=${lagProbe.sampleCount()})\n" +
                         "输入→上屏 lag: ${"%.1f".format(drawLagProbe.avgLagMs())} ms (n=${drawLagProbe.sampleCount()})\n$lastError"
+                    // A8-5：文案格式与 SDK 一致，供真机截图/人工记录直接读数对照三方延迟。
+                    // readMs 标 N/A（SWAPCHAIN 无 readback）；输入→上屏 lag 的代理在 present 完成
+                    // 打点（vsync 代理，口径与离屏 drawLagProbe 对等，见 vsync 循环注释）。
+                    RenderMode.SWAPCHAIN -> if (!started) "SDK init failed" else
+                        "Swapchain · FPS: ${"%.1f".format(fps)}\n" +
+                        "Frame: ${"%.2f".format(frameMs)} ms (p50 ${"%.2f".format(frameAcc.p50())} / p99 ${"%.2f".format(frameAcc.p99())})\n" +
+                        "Readback: N/A(无readback)\n" +
+                        "输入→上屏 lag(present): ${"%.1f".format(drawLagProbe.avgLagMs())} ms (n=${drawLagProbe.sampleCount()})\n$lastError"
                     RenderMode.INK -> "INK · FPS: ${"%.1f".format(fps)}\n" +
                         "Frame: ${"%.2f".format(frameMs)} ms (p50 ${"%.2f".format(frameAcc.p50())} / p99 ${"%.2f".format(frameAcc.p99())})\n" +
                         "Readback: n/a(无readback)\n" +
@@ -540,16 +646,11 @@ fun PaintScreen() {
                 style = MaterialTheme.typography.labelSmall,
                 modifier = Modifier.align(Alignment.BottomEnd).safeDrawingPadding().padding(12.dp),
             )
-            // A8-1/A8-4 渲染模式开关（右上角，D6 参数开关上方）：三段循环
-            // SDK → SDK_SURFACE_VIEW → INK → SDK，一次点击切到下一档，即切即生效。
+            // A8-1/A8-4/A8-5 渲染模式开关（右上角，D6 参数开关上方）：四段循环
+            // SDK → SWAPCHAIN → SDK_SURFACE_VIEW → INK → SDK（SWAPCHAIN 紧邻默认态 SDK，
+            // 主对照一次点击即达；顺序见 [nextRenderMode]），一次点击切到下一档，即切即生效。
             Text(
-                text = "渲染: ${
-                    when (renderMode) {
-                        RenderMode.SDK -> "SDK"
-                        RenderMode.SDK_SURFACE_VIEW -> "SurfaceView"
-                        RenderMode.INK -> "INK"
-                    }
-                }（点按切换）",
+                text = "渲染: ${renderMode.hudLabel}（点按切换）",
                 color = Color.White,
                 style = MaterialTheme.typography.labelMedium,
                 modifier = Modifier
@@ -559,28 +660,34 @@ fun PaintScreen() {
                     .background(
                         when (renderMode) {
                             RenderMode.SDK -> Color(0x66000000)
+                            RenderMode.SWAPCHAIN -> Color(0x66007A7A)
                             RenderMode.SDK_SURFACE_VIEW -> Color(0x661565C0)
                             RenderMode.INK -> Color(0x661B5E20)
                         },
                         RoundedCornerShape(8.dp),
                     )
                     .clickable {
-                        val next = when (renderMode) {
-                            RenderMode.SDK -> RenderMode.SDK_SURFACE_VIEW
-                            RenderMode.SDK_SURFACE_VIEW -> RenderMode.INK
-                            RenderMode.INK -> RenderMode.SDK
-                        }
-                        // 切离 SDK 系（SDK/SDK_SURFACE_VIEW，本次即将进入 INK）前收尾进行中
-                        // 笔画，避免残留半笔画跨模式。
+                        val prev = renderMode
+                        val next = nextRenderMode(prev)
+                        // 切离 SDK 系（SDK/SWAPCHAIN/SDK_SURFACE_VIEW，本次即将进入 INK）前收尾
+                        // 进行中笔画，避免残留半笔画跨模式。
                         if (isSdkFamily && strokeActive) {
                             ctx.nativeStrokeEnd()
                             strokeActive = false
                         }
+                        // A8-5：切离 SWAPCHAIN 时断开 surface（SDK 回离屏 + 清纸白 + 释放
+                        // ANativeWindow）。其 SurfaceView 随后随重组销毁、surfaceDestroyed 会再走
+                        // 一次 disconnectSwapchain（幂等）。注：SDK dgcSetSurface(NULL) 会重建
+                        // 离屏画布——SWAPCHAIN↔其它模式切换将清空既有笔迹（SDK 行为，真机口径内确认）。
+                        if (prev == RenderMode.SWAPCHAIN) disconnectSwapchain()
                         renderMode = next
                         lagProbe.clear()   // 模式切换重置量化样本，保证 A/B/C 各采独立数据
                         drawLagProbe.clear()
                         frameAcc.clear()
                         if (next != RenderMode.INK) dirty = true   // 切回 SDK 系：下帧读回刷新画布
+                        // SWAPCHAIN 的 present 源恒为整张画布（无 readback 路径的缩放视口概念），
+                        // 进入即重置 zoom=1 保持「所见即输入映射」一致。
+                        if (next == RenderMode.SWAPCHAIN) zoom = 1f
                     }
                     .padding(horizontal = 10.dp, vertical = 4.dp),
             )
@@ -712,8 +819,27 @@ fun PaintScreen() {
                     .padding(bottom = 20.dp),
             ) { Text("清空画布") }
 
+            // A8-5 SWAPCHAIN：导出按钮仍走 dgcExportPNG（离屏权威路径）——present 路径不读回、
+            // 画布不出 Compose，落盘 PNG 是「SWAPCHAIN 导出 == 离屏逐位一致」的 on-device 验证侧
+            // （真机验收口径）。放在左下角预测开关上方（bottom 让出 20dp 的预测开关）。
+            if (renderMode == RenderMode.SWAPCHAIN) {
+                Button(
+                    onClick = {
+                        val file = File(context.filesDir, "sdk_swapchain_snapshot.png")
+                        val ok = ctx.nativeExportPng(file.absolutePath)
+                        lastError = if (ok) "PNG 已导出: ${file.absolutePath}" else "PNG 导出失败"
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0D47A1)),
+                    modifier = Modifier
+                        .align(Alignment.BottomStart)
+                        .safeDrawingPadding()
+                        .padding(start = 20.dp, bottom = 72.dp),
+                ) { Text("导出 PNG(SDK 离屏)") }
+            }
+
             // P7-4 验证：笔迹预测 开/关（画布左下角常驻，点按即切、无需开面板）。SDK 系
-            // （SDK/SDK_SURFACE_VIEW，A8-4 起两者共享同一 SDK 引擎实例的预测开关）显示。
+            // （SDK/SWAPCHAIN/SDK_SURFACE_VIEW，A8-4/5 共享同一 SDK 引擎实例的预测开关）显示；
+            // SWAPCHAIN 态预测尖经 SDK present 的 tip merge 源选择显示（无 readback 亦有预测尖）。
             // 默认关（id12 default=0，与 SDK modeler 惰性激活的 passthrough 态一致——fresh 无预测，
             // 见 BrushSettingSpecTest 回归）；开 = prediction_interval_ms(12) 拨 20（首次点「开」
             // 即真实下发并激活 modeler，之后具备预测领先）。

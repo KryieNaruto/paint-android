@@ -50,6 +50,9 @@ android {
                 // brush_composite.comp 预编译为 SPIR-V 内嵌字节数组。arm64-v8a 现在
                 // 可编出带真实 Vulkan 后端（VkBackend）的 libdgc_paint.so。
                 arguments += "-DDGCPAIN_RENDER_VULKAN=ON"
+                // A8-5d：不再强制打开 DGCPAIN_PERF（A8-5b 诊断插桩开关，默认 OFF、零开销）。
+                // 该插桩基础设施（core/dgc_perf_log.h + SDK CMake 选项）保留，后续延迟调优
+                // 需要时在 SDK 侧构建显式 -DDGCPAIN_PERF=ON 即可，消费端不强制打开。
                 cppFlags += "-std=c++17"
             }
         }
