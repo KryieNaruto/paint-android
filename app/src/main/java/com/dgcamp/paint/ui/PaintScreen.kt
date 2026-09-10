@@ -72,8 +72,11 @@ internal data class BrushSettingSpec(
 // settingId 0-2（radius/hardness/opacity）自 SDK bugfix 起经内核 Brush::setBase 实时生效于
 // 下一笔 stroke（映射表注，笔画之间生效），保留控件与 PC 一致；4-12 为 stroke modeler 参数
 // （惰性激活，生效于新笔画）。跳过 3（RADIUS_LOG，PC 也未接）。id 与 sdk_api/dgc_paint_c_api.h
-// 的 DgcBrushSetting 枚举一致。spring 默认值对齐 SDK 新默认（K/m=40000、C/m=400，ωn=200 rad/s
-// 临界阻尼，见 core/stroke_predictor.h bugfix Fix B 校准依据）。
+// 的 DgcBrushSetting 枚举一致。默认值是 A8-5d 真机手工扫滑杆定下的「最跟手」组合
+// （wobble=0 关平滑、K/m=100000 配 C/m=632 构成临界阻尼 ζ=1、预测间隔=0 关预测），
+// 覆盖 SDK 侧缺省（wobble=40 / K=40000 / C=400，见 core/stroke_predictor.h）；
+// SDK 缺省保持不变以免波及 determinism/golden 测试。id8 的 100000 正好落在区间上边界
+// （1000..100000），Slider 不 clamp（value==max 仍在 valueRange 内）。
 internal val BRUSH_SETTINGS = listOf(
     // 0-2：笔刷内核基础参数（bugfix 起经内核 setBase 实时生效于下一笔 stroke），effect 注明生效时机。
     BrushSettingSpec(0, "半径 radius", 1f, 100f, 20f, "越大笔触越粗；改动在下一笔生效"),
@@ -81,15 +84,15 @@ internal val BRUSH_SETTINGS = listOf(
     BrushSettingSpec(2, "不透明度 opacity", 0f, 1f, 1f, "越大颜色越浓、越不透明；改动在下一笔生效"),
     // 4-12：stroke modeler 参数（惰性激活，生效于新笔画）。effect 逐条取自
     // sdk/docs/brush_settings_mapping.md「改参效果（人工可辨）」列（Bug #2）。
-    BrushSettingSpec(4, "抖动消除超时 wobble_timeout_ms", 0f, 200f, 10f, "越大越平滑但越迟滞跟手"),
+    BrushSettingSpec(4, "抖动消除超时 wobble_timeout_ms", 0f, 200f, 0f, "越大越平滑但越迟滞跟手；默认 0（关平滑，最跟手）"),
     BrushSettingSpec(5, "抖动消除最低速度 wobble_speed_floor", 0f, 10f, 1.31f, "越大越容易判定为静止抖动而被压平"),
     BrushSettingSpec(6, "最小输出采样率 min_output_rate_hz", 20f, 500f, 180f, "越大补点越密、曲线越平滑，也决定预测点间距"),
     BrushSettingSpec(7, "抬笔停止距离 end_of_stroke_stopping_distance_mm", 0.01f, 5f, 0.1f, "越大末端预测点越倾向继续外推"),
-    BrushSettingSpec(8, "弹簧质量常量 spring_mass_constant", 1000f, 100000f, 40000f, "越大响应越快、越跟手"),
-    BrushSettingSpec(9, "弹簧阻尼常量 spring_drag_constant", 10f, 2000f, 400f, "越大抑制过冲越强、运动越粘滞"),
+    BrushSettingSpec(8, "弹簧质量常量 spring_mass_constant", 1000f, 100000f, 100000f, "越大响应越快、越跟手；默认 100000（最快，与 C=632 构成临界阻尼 ζ=1）"),
+    BrushSettingSpec(9, "弹簧阻尼常量 spring_drag_constant", 10f, 2000f, 632f, "越大抑制过冲越强、运动越粘滞；默认 632（K=100000 的临界阻尼，刚好不过冲）"),
     BrushSettingSpec(10, "卡尔曼过程噪声 kalman_process_noise", 0.00001f, 0.01f, 0.0005f, "越大越信任最新输入，速度估计更灵敏但更抖"),
     BrushSettingSpec(11, "卡尔曼测量噪声 kalman_measurement_noise", 0.0001f, 0.1f, 0.004f, "越大越不信任单次量测，估计速度越平滑但滞后"),
-    BrushSettingSpec(12, "预测间隔 prediction_interval_ms", 0f, 100f, 0f, "越大预测点越远，越易见抢跑漂移"),
+    BrushSettingSpec(12, "预测间隔 prediction_interval_ms", 0f, 100f, 0f, "越大预测点越远，越易见抢跑漂移；默认 0（预测关，实测最跟手）"),
 )
 
 /** 滑杆读数短格式：整数不带小数，小数值按 decimals 位取整后去尾零。 */
